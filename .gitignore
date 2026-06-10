@@ -1,0 +1,16 @@
+data/raw/
+data/processed/
+*.pyc
+__pycache__/
+.ipynb_checkpoints/
+.venv/
+venv/
+*.egg-info/
+dist/
+build/
+.env
+*.parquet
+*.csv
+*.zip
+CLAUDE.md
+Technical_Design_Document.md
