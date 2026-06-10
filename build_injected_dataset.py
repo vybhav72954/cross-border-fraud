@@ -15,7 +15,8 @@ import pandas as pd
 
 sys.path.insert(0, ".")
 from src.inject import (  # noqa: E402
-    build_controlled_dataset, DEFAULT_COUNTS, TYPOLOGY_COL, TYPOLOGIES,
+    build_controlled_dataset, DEFAULT_COUNTS, DEFAULT_OVERLAP,
+    TYPOLOGY_COL, TYPOLOGIES, typology_dummies, is_cross_border,
 )
 from src.labels import _haversine_series  # noqa: E402
 
@@ -32,13 +33,15 @@ def summarize(aug: pd.DataFrame) -> None:
     n = len(aug)
     n_fraud = int((aug["is_fraud"] == 1).sum())
     print(f"  rows: {n:,}   fraud: {n_fraud:,} ({n_fraud / n * 100:.2f}%)")
-    vc = aug[TYPOLOGY_COL].value_counts()
+    dums = typology_dummies(aug)
     for typ in TYPOLOGIES:
-        cnt = int(vc.get(typ, 0))
-        ev = aug.loc[aug[TYPOLOGY_COL] == typ, "inj_event"].nunique()
-        print(f"    {typ:9s} rows={cnt:>6,}  events={ev:>5,}")
-    # sanity: the geo injector should now produce far-from-home merchants
-    geo = aug[aug[TYPOLOGY_COL] == "geo"]
+        print(f"    {typ:9s} rows (incl. overlap) = {int(dums[typ].sum()):>6,}")
+    cb = is_cross_border(aug)
+    print(f"    cross_border (>=2 typologies): {int(cb.sum()):,} rows")
+    for combo, c in aug.loc[cb, TYPOLOGY_COL].value_counts().items():
+        print(f"      {combo:24s} {int(c):>5,}")
+    # sanity: every geo signature (single or overlap) should be far from home
+    geo = aug.loc[dums["geo"] == 1]
     if len(geo):
         d = _haversine_series(geo["lat"], geo["long"], geo["merch_lat"], geo["merch_long"])
         print(f"    geo distance km: median={d.median():.0f}  min={d.min():.0f}  max={d.max():.0f}")
@@ -54,7 +57,8 @@ def main() -> None:
         df = pd.read_csv(path, index_col=0,
                          parse_dates=["trans_date_trans_time", "dob"])
         counts = {k: max(int(v * scale), 1) for k, v in DEFAULT_COUNTS.items()}
-        aug = build_controlled_dataset(df, counts=counts, seed=seed)
+        overlap = {k: max(int(v * scale), 1) for k, v in DEFAULT_OVERLAP.items()}
+        aug = build_controlled_dataset(df, counts=counts, overlap=overlap, seed=seed)
         out = OUT / f"injected_{split}.parquet"
         aug.to_parquet(out, index=False)
         print(f"[{split}] wrote {out}")
