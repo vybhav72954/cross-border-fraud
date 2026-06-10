@@ -121,7 +121,7 @@ Beyond the production classifier, the project carries a complete categorical inf
 ## Dataset
 
 **Primary:** [Credit Card Transactions Fraud Detection](https://www.kaggle.com/datasets/kartik2112/fraud-detection) — Sparkov-generated, **CC0 public domain**
-~1.2 M transactions · 1,000 cardholders · 800 merchants · 6-month window
+1.3 M train · 556 K test · 983 cardholders · 693 merchants · 14 categories · Jan 2019 – Jun 2020
 
 **Secondary (benchmark only):** [IEEE-CIS Fraud Detection](https://www.kaggle.com/c/ieee-fraud-detection) — one external validation fold, not used in label engineering.
 
@@ -134,7 +134,7 @@ Beyond the production classifier, the project carries a complete categorical inf
 ### 1. Clone and install
 
 ```bash
-git clone https://github.com/<you>/cross-border-credit.git
+git clone https://github.com/vybhav72954/cross-border-fraud.git
 cd cross-border-credit
 
 pip install pandas numpy scipy statsmodels scikit-learn matplotlib seaborn \

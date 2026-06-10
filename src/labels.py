@@ -17,17 +17,20 @@ from __future__ import annotations
 
 import numpy as np
 import pandas as pd
-from math import radians, cos, sin, asin, sqrt
+from tqdm.auto import tqdm
 
-# ── Thresholds (fixed; sensitivity ±20% reported separately) ──────────────────
-VELOCITY_WINDOW_MIN: int = 30       # rolling window in minutes
-VELOCITY_MIN_TXN: int = 3           # transactions in window to fire L_V
-GEO_DISTANCE_KM: float = 500.0      # km from home to merchant to fire L_G
-RING_WINDOW_HOURS: int = 24         # ± hours around a transaction for ring check
-RING_MIN_CARDS: int = 3             # distinct cc_nums at same merchant in window
-TEMPORAL_IQR_MULTIPLIER: float = 1.5
+# ── Thresholds ────────────────────────────────────────────────────────────────
+# Tuned to the Sparkov train distribution (see threshold diagnostic, 2026-06-10);
+# sensitivity ±20% reported separately. Rationale per label noted inline.
+VELOCITY_WINDOW_MIN: int = 60       # 30→60: (3 txns/30min) caught 7% of fraud; 60min catches 17%
+VELOCITY_MIN_TXN: int = 3
+GEO_DISTANCE_KM: float = 120.0      # 500→120 (~p95): max home-merchant dist is 152 km on Sparkov
+RING_WINDOW_HOURS: int = 72         # 24→72: (3 cards/±24h) caught 0.2% of fraud; ±72h catches 3.1%
+RING_MIN_CARDS: int = 3
+TEMPORAL_IQR_MULTIPLIER: float = 1.0  # 1.5→1.0: k=1.5 fired 0.03%; k=1.0 fires 1.1% at 4.4x fraud-lift
 CATEGORY_LOOKBACK_DAYS: int = 30
-COLD_START_MIN_DAYS: int = 7        # use global prior below this history length
+CATEGORY_RARITY_THRESHOLD: float = 0.0  # fire when category's window share <= this; 0.0 = unseen
+COLD_START_MIN_DAYS: int = 7
 
 LABEL_COLS = ["L_V", "L_G", "L_C", "L_R", "L_T"]
 
@@ -55,7 +58,6 @@ def _derive_L_V(df: pd.DataFrame) -> pd.Series:
     df_s = df.sort_values(["cc_num", "trans_dt"]).copy()
     df_s = df_s.set_index("trans_dt")
     window = f"{VELOCITY_WINDOW_MIN}min"
-    # count transactions (including self) in rolling window per card
     counts = (
         df_s.groupby("cc_num", group_keys=False)["trans_num"]
         .rolling(window, closed="both")
@@ -76,28 +78,39 @@ def _derive_L_G(df: pd.DataFrame) -> pd.Series:
 
 
 def _derive_L_C(df: pd.DataFrame) -> pd.Series:
-    """Category anomaly: transaction category ≠ modal category over prior CATEGORY_LOOKBACK_DAYS.
-    Not gated. Uses global modal category as cold-start prior."""
-    global_mode = df["category"].mode().iloc[0]
-    df_s = df.sort_values(["cc_num", "trans_dt"]).copy()
-    results: list[tuple[int, int]] = []
+    """Category anomaly: the current category is rare in the cardholder's prior
+    CATEGORY_LOOKBACK_DAYS of activity — its share of that window is
+    <= CATEGORY_RARITY_THRESHOLD (default 0.0 → category unseen in the window).
+    Not gated. A transaction with no prior history in the window does not fire,
+    since there is no basis to judge rarity.
 
-    for cc, g in df_s.groupby("cc_num", sort=False):
-        g = g.reset_index()
-        flags = []
-        for i, row in g.iterrows():
-            cutoff = row["trans_dt"] - pd.Timedelta(days=CATEGORY_LOOKBACK_DAYS)
-            history = g[(g["trans_dt"] < row["trans_dt"]) & (g["trans_dt"] >= cutoff)]
-            span_days = (row["trans_dt"] - g["trans_dt"].min()).days
-            if span_days < COLD_START_MIN_DAYS or len(history) == 0:
-                modal = global_mode
-            else:
-                modal = history["category"].mode().iloc[0]
-            flags.append((g.at[i, "index"], int(row["category"] != modal)))
-        results.extend(flags)
+    (Replaces the original ``!= modal category`` rule, which fired on ~89% of
+    transactions — see threshold diagnostic.)"""
+    cats_arr = np.array(sorted(df["category"].unique()))
+    cidx = {c: i for i, c in enumerate(cats_arr)}
+    window = f"{CATEGORY_LOOKBACK_DAYS}D"
+    df_s = df.sort_values(["cc_num", "trans_dt"])
+    out = pd.Series(0, index=df.index, dtype=np.int8)
 
-    idx, vals = zip(*results) if results else ([], [])
-    return pd.Series(vals, index=idx, dtype=np.int8).reindex(df.index).fillna(0).astype(np.int8)
+    for _, g in tqdm(df_s.groupby("cc_num", sort=False), desc="  L_C per card",
+                     unit="card", ncols=80):
+        # Category counts in the trailing window [t - lookback, t), per row;
+        # closed="left" excludes the current row → matches the strict `< t` cutoff.
+        onehot = (pd.get_dummies(g["category"])
+                  .reindex(columns=cats_arr, fill_value=0).astype(np.int32))
+        onehot.index = g["trans_dt"].to_numpy()
+        counts = onehot.rolling(window, closed="left").sum().fillna(0).to_numpy()
+        total = counts.sum(axis=1)
+        idx = np.array([cidx[c] for c in g["category"].to_numpy()])
+        cur = counts[np.arange(len(g)), idx]
+        with np.errstate(invalid="ignore", divide="ignore"):
+            share = np.where(total > 0, cur / total, np.nan)
+
+        # Fire only with prior history (total > 0) and a rare/unseen category.
+        flag = (total > 0) & (share <= CATEGORY_RARITY_THRESHOLD)
+        out.loc[g.index] = flag.astype(np.int8)
+
+    return out
 
 
 def _derive_L_R(df: pd.DataFrame) -> pd.Series:
@@ -107,14 +120,13 @@ def _derive_L_R(df: pd.DataFrame) -> pd.Series:
     if fraud.empty:
         return pd.Series(0, index=df.index, dtype=np.int8)
 
-    # For each fraudulent transaction find distinct cc_nums at same merchant in ±window
     fraud = fraud.sort_values("trans_dt").reset_index(names="orig_idx")
     window = pd.Timedelta(hours=RING_WINDOW_HOURS)
 
     ring_orig_idxs: set[int] = set()
-    merchant_groups = fraud.groupby("merchant", sort=False)
+    merchant_groups = list(fraud.groupby("merchant", sort=False))
 
-    for _, mg in merchant_groups:
+    for _, mg in tqdm(merchant_groups, desc="  L_R per merchant", unit="merch", ncols=80):
         if len(mg) < RING_MIN_CARDS:
             continue
         mg = mg.sort_values("trans_dt").reset_index(drop=True)
@@ -135,28 +147,27 @@ def _derive_L_R(df: pd.DataFrame) -> pd.Series:
 def _derive_L_T(df: pd.DataFrame) -> pd.Series:
     """Temporal anomaly: transaction hour outside Tukey 1.5×IQR of cardholder's
     hour-of-day distribution. Not gated. Uses global IQR as cold-start prior."""
-    df_s = df.copy()
-    df_s["_hour"] = df_s["trans_dt"].dt.hour
+    hour = df["trans_dt"].dt.hour
 
-    global_q1, global_q3 = df_s["_hour"].quantile([0.25, 0.75])
-    global_iqr = global_q3 - global_q1
-    global_lo = global_q1 - TEMPORAL_IQR_MULTIPLIER * global_iqr
-    global_hi = global_q3 + TEMPORAL_IQR_MULTIPLIER * global_iqr
+    gq1, gq3 = df["trans_dt"].dt.hour.quantile([0.25, 0.75])
+    giqr = gq3 - gq1
+    global_lo = gq1 - TEMPORAL_IQR_MULTIPLIER * giqr
+    global_hi = gq3 + TEMPORAL_IQR_MULTIPLIER * giqr
 
-    results: dict[int, int] = {}
-    for cc, g in df_s.groupby("cc_num", sort=False):
-        span_days = (g["trans_dt"].max() - g["trans_dt"].min()).days
-        if span_days < COLD_START_MIN_DAYS or len(g) < 4:
-            lo, hi = global_lo, global_hi
-        else:
-            q1, q3 = g["_hour"].quantile([0.25, 0.75])
-            iqr = q3 - q1
-            lo = q1 - TEMPORAL_IQR_MULTIPLIER * iqr
-            hi = q3 + TEMPORAL_IQR_MULTIPLIER * iqr
-        for idx, row in g.iterrows():
-            results[idx] = int(row["_hour"] < lo or row["_hour"] > hi)
+    by_card = hour.groupby(df["cc_num"])
+    q1 = df["cc_num"].map(by_card.quantile(0.25))
+    q3 = df["cc_num"].map(by_card.quantile(0.75))
+    iqr = q3 - q1
+    lo = q1 - TEMPORAL_IQR_MULTIPLIER * iqr
+    hi = q3 + TEMPORAL_IQR_MULTIPLIER * iqr
 
-    return pd.Series(results, dtype=np.int8).reindex(df.index).fillna(0).astype(np.int8)
+    span = df.groupby("cc_num")["trans_dt"].agg(["min", "max", "size"])
+    cold = (span["max"] - span["min"]).dt.days < COLD_START_MIN_DAYS
+    use_global = df["cc_num"].map(cold | (span["size"] < 4))
+    lo = lo.where(~use_global, global_lo)
+    hi = hi.where(~use_global, global_hi)
+
+    return ((hour < lo) | (hour > hi)).astype(np.int8)
 
 
 # ── Main entry point ───────────────────────────────────────────────────────────
@@ -179,20 +190,17 @@ def derive_labels(df: pd.DataFrame) -> pd.DataFrame:
     out = df.copy()
     out["trans_dt"] = pd.to_datetime(out["trans_date_trans_time"])
 
-    print("Deriving L_V (velocity burst)...")
-    out["L_V"] = _derive_L_V(out)
+    steps = [
+        ("L_V", "Velocity burst  ", _derive_L_V),
+        ("L_G", "Geographic anom.", _derive_L_G),
+        ("L_C", "Category anomaly", _derive_L_C),
+        ("L_R", "Ring membership ", _derive_L_R),
+        ("L_T", "Temporal anomaly", _derive_L_T),
+    ]
 
-    print("Deriving L_G (geographic anomaly)...")
-    out["L_G"] = _derive_L_G(out)
-
-    print("Deriving L_C (category anomaly)...")
-    out["L_C"] = _derive_L_C(out)
-
-    print("Deriving L_R (ring membership)...")
-    out["L_R"] = _derive_L_R(out)
-
-    print("Deriving L_T (temporal anomaly)...")
-    out["L_T"] = _derive_L_T(out)
+    for col, desc, fn in tqdm(steps, desc="Deriving labels", unit="label", ncols=80):
+        tqdm.write(f"\n[{desc}]")
+        out[col] = fn(out)
 
     out["label_cardinality"] = out[LABEL_COLS].sum(axis=1).astype(np.int8)
     out["cross_border"] = (out["label_cardinality"] >= 2).astype(np.int8)
