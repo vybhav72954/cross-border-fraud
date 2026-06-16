@@ -6,6 +6,7 @@ scipy>=1.13
 statsmodels>=0.14
 scikit-learn>=1.5
 patsy>=0.5
+pyarrow>=16.0          # parquet engine for data/processed
 
 # Visualisation
 matplotlib>=3.9
@@ -15,21 +16,19 @@ seaborn>=0.13
 jupyterlab>=4.2
 ipykernel>=6.29
 
-# Graph
-networkx>=3.3
-
 # GNN — install torch first from https://pytorch.org then:
 # pip install torch-geometric
 torch>=2.4
 torch-geometric>=2.6
 
-# Tabular benchmarks
-xgboost>=2.1
-lightgbm>=4.5
-tabpfn>=2.0
-
 # Dataset download
 kaggle>=1.6
 
-# Optional — GPU only, requires CUDA 12+
+# Optional — planned external/tabular comparison (roadmap F); not used by the
+# current controlled benchmark:
+# xgboost>=2.1
+# lightgbm>=4.5
+# tabpfn>=2.0
+
+# Optional — GPU only, requires CUDA 12+ (replaces the CPU fixed-A SSM fallback)
 # pip install mamba-ssm causal-conv1d

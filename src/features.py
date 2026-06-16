@@ -131,6 +131,7 @@ def severity_vector(df: pd.DataFrame) -> pd.Series:
 
 def velocity_count_vector(df: pd.DataFrame, window_min: int = 10) -> pd.Series:
     """Per-card transaction count in a rolling window — Poisson response."""
+    sorted_index = df.sort_values(["cc_num", "trans_dt"]).index
     df_s = df.sort_values(["cc_num", "trans_dt"]).set_index("trans_dt")
     window = f"{window_min}min"
     counts = (
@@ -139,5 +140,8 @@ def velocity_count_vector(df: pd.DataFrame, window_min: int = 10) -> pd.Series:
         .count()
     )
     counts.index = counts.index.droplevel(0)
-    result = counts.reset_index(drop=True)
-    return result.reindex(df.index).fillna(1).astype(int)
+    # counts are in (cc_num, trans_dt)-sorted order; map back to original rows
+    # via the sorted index before reindexing (reset_index(drop=True) would align
+    # sorted-order values to original positions — the alignment bug this fixes).
+    vel = pd.Series(counts.to_numpy(), index=sorted_index)
+    return vel.reindex(df.index).fillna(1).astype(int)

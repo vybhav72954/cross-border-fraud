@@ -2,10 +2,9 @@
 
 # CrossBorder
 
-### Multi-Label Fraud Typology Detection for Payment Networks
+### A Controlled Benchmark for Multi-Typology Card-Fraud Detection
 
 [![Python](https://img.shields.io/badge/python-3.11%2B-3776AB?logo=python&logoColor=white)](https://www.python.org/)
-[![License](https://img.shields.io/badge/license-MIT-22c55e)](LICENSE)
 [![Code style](https://img.shields.io/badge/code%20style-ruff-D97706)](https://docs.astral.sh/ruff/)
 [![Status](https://img.shields.io/badge/status-active-brightgreen)]()
 [![Dataset](https://img.shields.io/badge/dataset-Sparkov%20CC0-0EA5E9)](https://www.kaggle.com/datasets/kartik2112/fraud-detection)
@@ -16,86 +15,125 @@
 
 ---
 
-Most fraud detection systems ask one question: *fraud or not?*
+Most fraud detection asks one question: *fraud or not?* **CrossBorder** asks a sharper one:
 
-**CrossBorder** asks five simultaneously — and recognises that a single transaction can cross the boundaries of multiple fraud typologies at once. A velocity burst happening inside a coordinated merchant ring is not the same event as either alone. Collapsing both into a single binary label destroys exactly the information a response team needs to act.
+> **Which data representation recovers which kind of fraud — and what does it cost to *learn* that structure instead of hand-crafting it?**
 
-The system is built around a **statistical core with neural extensions**: five independent logistic regression classifiers (one per fraud type) sit at the centre, and graph- and sequence-based neural representations are admitted into the design matrix only after passing a likelihood-ratio test. The GLM stays the inference engine throughout.
+A velocity burst, a coordinated merchant ring, and an out-of-profile late-night transaction are different events with different *shapes*. Some of those shapes are visible in a single table row; others only exist in a **graph** (a ring is a merchant fan-in) or a **sequence** (a temporal anomaly is rare *for that card*). Collapsing them into one binary label throws away exactly the structure a response team needs — and exactly the structure that decides whether a graph or sequence model is worth its complexity.
 
----
-
-## What "cross-border" means here
-
-The name refers to **typological boundaries**, not geography. A transaction is *cross-border* when it simultaneously exhibits the behavioral signatures of more than one fraud class — it crosses the line between fraud categories. Empirically, these are the highest-risk events: the system detects, quantifies, and characterises them explicitly.
+CrossBorder answers this with a **controlled benchmark**: it plants fraud with *known* typology signatures into a legitimate-traffic background, then measures, per typology, whether a tabular GLM, a graph network, or a state-space sequence model is the representation that recovers it.
 
 ---
 
-## The five fraud labels
+## The pivot: don't detect downloaded fraud — plant it
 
-Five non-exclusive binary labels are derived from raw transaction features using rule-based heuristics **before any model is fit**. No label is derived from model output.
+The project began as plain Sparkov fraud detection and pivoted once the downloaded labels proved structurally empty. On the raw `is_fraud` labels the geographic signal was **fraud-uncorrelated** (lift ≈ 1.0) and the category signal saturated — there was no usable ring / geographic / sequence structure for a graph or sequence model to recover. Any neural extension would have "worked" only by overfitting noise.
 
-| Label | Name | Behavioral signature | Gated on confirmed fraud? |
-|---|---|---|---|
-| `L_V` | Velocity burst | ≥ 3 transactions from the same card in any 30-minute window | Yes |
-| `L_G` | Geographic anomaly | Cardholder home → merchant distance > 500 km | No |
-| `L_C` | Category anomaly | Merchant category outside cardholder's 30-day modal history | No |
-| `L_R` | Ring membership | ≥ 3 distinct fraudulent cards sharing the same merchant in ± 24 h | Yes |
-| `L_T` | Temporal anomaly | Transaction hour outside cardholder's historical Tukey 1.5 × IQR | No |
+So instead of *detecting* unknown fraud, CrossBorder **injects** fraud with ground-truth signatures (`src/inject.py`) and scores each representation against the answer key. Every neural method is handed data *designed to reward it* — which turns each model into a falsifiable claim ("a graph recovers a ring; tabular features can't") rather than a leaderboard number with no mechanism behind it.
 
-`L_G`, `L_C`, `L_T` are **anomaly-precursor** labels — they fire on legitimate transactions too, surfacing pre-fraud behavioural drift. `L_V` and `L_R` are **confirmed-subtype** labels gated on `is_fraud = 1`.
+### Five injected typologies → the representation that should catch each
 
-A transaction is *cross-border* when `|L| ≥ 2`.
+| typology   | injected signature                                                   | detector slot       |
+|------------|----------------------------------------------------------------------|---------------------|
+| `ring`     | *K* distinct cards hit one merchant inside a short window (fan-in)    | **GNN** (graph)     |
+| `velocity` | one card, many transactions in a short window                        | SSM / tabular       |
+| `temporal` | a transaction at one of the card's **rarest hours-of-day**           | **SSM** (sequence)  |
+| `category` | a transaction in one of the card's rarest categories                 | GLM (tabular)       |
+| `geo`      | a merchant placed implausibly far from the card's home               | GLM (tabular)       |
+
+**Controlled-benchmark invariant (leak-free):** an injected row matches the legit distribution on **every axis except the intended signature** — `amt` and the timestamp are sampled from the legit pools, and merchant coordinates reuse the legit home→merchant offset distribution (except `geo`). A detector can only succeed via the real signal, never a distributional artifact. **Overlap** events stamp two compatible signatures on one event, producing the `cross_border` ground truth.
+
+---
+
+## Headline results — the bake-off
+
+Isolated test AUC: each signature's **solo rows vs. legit** (overlaps excluded, so no typology can borrow another's signal). Methodology and reproduction live in the bake-off scripts and notebooks 06–08.
+
+| typology     | tabular GLM | structural oracle                  | learned neural        | LR-test gate                         |
+|--------------|:-----------:|------------------------------------|-----------------------|--------------------------------------|
+| **ring**     | 0.582       | **0.959** windowed merchant fan-in | **0.841** RingSAGE    | ✓ admitted · *G²*=9732, df 2, *p*≈0  |
+| **temporal** | 0.702       | **0.877** card-relative hour-rarity| **0.806** TemporalSSM | ✓ admitted · *G²*=12247, df 2, *p*≈0 |
+| velocity     | 0.882       | — (rolling 1 h count is tabular)   | —                     | tabular-solved                       |
+| category     | 0.874       | —                                  | —                     | tabular                              |
+| geo          | 1.000       | — (haversine distance is tabular)  | —                     | tabular-solved (null control)        |
+
+**Reading:** `ring` and `temporal` are the two signatures invisible to a single table row — a ring is a *time-windowed* merchant fan-in (tabular ≈ chance), a temporal anomaly is *card-relative* (global `hour_sin/cos` tops out at 0.70). In both, the learned model sits **between tabular and the hand-crafted oracle** ("the network recovers most of the signal; the oracle is the ceiling"), and clears the LR-test admission gate overwhelmingly. `geo`/`velocity`/`category` stay tabular by design — `geo` is kept as the **null-LR-test negative control**.
+
+### External validation — does the premise hold on real fraud?
+
+The reason for planting is that *real* fraud is entangled across typologies, so clean signatures must be injected to measure recovery at all. An external fold on the fully-anonymized **IEEE-CIS** dataset confirms this: the planted oracles fall to chance on real `isFraud` (card-relative hour-rarity **0.45**, decayed-rate **0.49**, versus **0.88 / 0.91** on the planted signatures), while a tabular GLM over engineered count features carries real fraud at **0.83**. Real fraud is not a single planted typology — injection is *necessary*, not a shortcut. The per-card sequence machinery still clears the same LR-test gate, but its held-out lift is marginal once those engineered counts are present (the "effect size, not raw *p*" caveat, reproduced out of domain). Because IEEE-CIS is anonymized — no merchant id, coordinates, or clean card key — the typologies cannot be re-injected there, so this fold validates the **premise and representation relevance**, not the which-representation-recovers-which thesis, which needs the answer key only injection provides.
 
 ---
 
 ## Architecture
 
+The benchmark validates the slots of a single production architecture: neural networks are **feature extractors only**, admitted into a statistical classifier through a per-label likelihood-ratio test. The GLM stays the inference engine.
+
 ```
                          ┌─────────────┐
-                         │  Raw data   │  Sparkov · 1.2 M transactions
+                         │  Raw data   │  Sparkov · legit background
                          └──────┬──────┘
                                 │
                ┌────────────────▼────────────────┐
-               │     Rule-based label engine      │  src/labels.py
-               │  L_V  L_G  L_C  L_R  L_T        │  runs before any model
+               │   Controlled injection engine    │  src/inject.py
+               │  ring velocity temporal cat geo  │  known signatures + answer key
                └────────────────┬────────────────┘
                                 │
           ┌─────────────────────┼─────────────────────┐
           │                     │                     │
    ┌──────▼──────┐       ┌──────▼──────┐      ┌──────▼──────┐
-   │    GNN      │       │    Mamba    │      │  Classical  │
+   │  RingSAGE   │       │ TemporalSSM │      │  Classical  │
    │ card↔merch  │       │  per-card   │      │  features   │
-   │  bipartite  │       │  sequences  │      │  (tabular)  │
+   │  ±window    │       │  sequences  │      │  (tabular)  │
    └──────┬──────┘       └──────┬──────┘      └──────┬──────┘
           │  LR test ✓          │  LR test ✓          │
           └─────────────────────▼─────────────────────┘
                                 │
                     ┌───────────▼───────────┐
-                    │  Binary-relevance GLM │  K = 5 logistic models
+                    │  Binary-relevance GLM │  K independent logits
                     │     (statsmodels)     │  one per fraud label
                     └───────────┬───────────┘
                                 │
-                   L̂_V  L̂_G  L̂_C  L̂_R  L̂_T
-                   prediction vector ∈ {0,1}⁵
+                       prediction vector L̂
 ```
 
-Neural extensions are **feature extractors only** — they augment the GLM design matrix and must pass a per-label likelihood-ratio test before admission. The logistic models remain the classifiers and produce interpretable odds ratios, Wald tests, and calibration diagnostics for every label.
+A neural scalar enters the GLM design matrix **for a given label only after a significant nested likelihood-ratio test** (`BinaryRelevanceGLM.admit_extension`). An extension admitted for `ring` is not automatically admitted for `geo` — the gate is per-label. The logistic core keeps interpretable odds ratios, Wald tests, and calibration for every label regardless of which extensions are admitted.
+
+---
+
+## Two response tracks
+
+CrossBorder carries two complementary label systems on the same data:
+
+**1. Injected typologies (the benchmark answer key).** Ground truth for "which representation recovers which structure," read back from the `typology` / `inj_event` columns via `typology_dummies()` / `is_cross_border()`. This drives the bake-off above.
+
+**2. Rule-based labels (the statistical-inference layer).** Five non-exclusive binary labels derived from raw features by fixed heuristics **before any model is fit** (`src/labels.py`), used for the categorical-data-analysis companion (χ², odds ratios, log-linear, calibration). Thresholds were **data-tuned to the Sparkov distribution** (see threshold diagnostic):
+
+| Label | Name | Trigger (tuned) | Gated on confirmed fraud? |
+|---|---|---|---|
+| `L_V` | Velocity burst | ≥ 3 transactions from the same card in any **60-minute** window | Yes |
+| `L_G` | Geographic anomaly | home → merchant distance **> 120 km** | No |
+| `L_C` | Category anomaly | category **unseen** in the cardholder's prior 30-day history | No |
+| `L_R` | Ring membership | ≥ 3 distinct fraudulent cards sharing a merchant in **± 72 h** | Yes |
+| `L_T` | Temporal anomaly | hour outside the cardholder's **Tukey 1.0 × IQR** (global cold-start prior) | No |
+
+The two systems are cross-checked as a loop-closure sanity check, but for the bake-off the **injection typology is ground truth**.
 
 ---
 
 ## Statistical analysis layer
 
-Beyond the production classifier, the project carries a complete categorical inference layer:
+Beyond the production classifier, the project carries a categorical inference layer over the rule-based labels:
 
 | Analysis | Technique |
 |---|---|
-| Feature–label association | Pearson χ², Cramér's V across all feature × label pairs |
+| Feature–label association | Pearson χ², Cramér's V across feature × label pairs |
 | Odds ratios | 2×2 tables with Haldane–Anscombe correction and 95% CIs |
-| Confounding control | Mantel–Haenszel stratified OR (e.g. `L_V × L_R` by `category`) |
-| Label co-occurrence | Pairwise χ² and OR matrix across all 10 label pairs |
-| Feature × label 3-way | Log-linear Poisson GLM; tests conditional independence |
-| **Label joint distribution** | Log-linear on 2⁵ = 32-cell table; recovers the label association graph |
-| Calibration | Hosmer–Lemeshow test per binary logit |
+| Confounding control | Mantel–Haenszel stratified OR (`L_V × L_R` by `category`) |
+| Label co-occurrence | Pairwise χ² and OR matrix |
+| Feature × label 3-way | Log-linear Poisson GLM; conditional independence |
+| **Label joint distribution** | Log-linear on the 2⁵ = 32-cell table; label-association graph |
+| Calibration | Hosmer–Lemeshow per binary logit |
 | Severity | Proportional-odds model on `|L|` ∈ {0 … 5} |
 | Velocity counts | Poisson / Negative-Binomial regression on transaction rate |
 
@@ -108,24 +146,26 @@ Beyond the production classifier, the project carries a complete categorical inf
 | Statistical inference | `statsmodels` |
 | Data wrangling | `pandas` · `numpy` |
 | Statistical tests | `scipy.stats` |
-| Graph construction | `networkx` |
-| Graph neural network | `torch-geometric` — GraphSAGE / GAT |
-| Sequence model | `torch` DiscretizedSSM (CPU) · `mamba-ssm` (GPU) |
-| Tabular benchmarks | `xgboost` · `lightgbm` · `tabpfn` |
+| Graph neural network | `torch-geometric` — GraphSAGE over a bipartite `(card, merchant-time-bucket)` graph |
+| Sequence model | `torch` + `scipy.signal` — fixed-*A* diagonal SSM (CPU) · `mamba-ssm` (GPU, optional) |
 | Multi-label metrics | `scikit-learn` |
 | Visualisation | `matplotlib` · `seaborn` |
 | Notebooks | `jupyterlab` |
+
+> An external-validity fold on IEEE-CIS is included (see *External validation* above). A gradient-boosting tabular comparison (`xgboost` · `lightgbm` · `tabpfn`) remains optional and is not required by the benchmark.
 
 ---
 
 ## Dataset
 
-**Primary:** [Credit Card Transactions Fraud Detection](https://www.kaggle.com/datasets/kartik2112/fraud-detection) — Sparkov-generated, **CC0 public domain**
-1.3 M train · 556 K test · 983 cardholders · 693 merchants · 14 categories · Jan 2019 – Jun 2020
+**Primary:** [Credit Card Transactions Fraud Detection](https://www.kaggle.com/datasets/kartik2112/fraud-detection) — Sparkov-generated, **CC0 public domain**.
+1.3 M train · 556 K test · 983 cardholders · 693 merchants · 14 categories · Jan 2019 – Jun 2020.
 
-**Secondary (benchmark only):** [IEEE-CIS Fraud Detection](https://www.kaggle.com/c/ieee-fraud-detection) — one external validation fold, not used in label engineering.
+After injection (`build_injected_dataset.py`): **1,312,269 train** rows / **563,507 test** rows, each at **1.76 % injected fraud**, with **5,600 / 2,408** cross-border (overlap) events.
 
-> Sparkov is simulator-generated. Fraud patterns are more learnable than real production data; results should be interpreted with that in mind.
+**Secondary (benchmark only):** [IEEE-CIS Fraud Detection](https://www.kaggle.com/c/ieee-fraud-detection) — external validation fold, never used in label engineering or injection.
+
+> Sparkov is simulator-generated; its fraud is cleaner and more separable than real production traffic (`geo` separating perfectly is a symptom of that). The benchmark answers *"which representation recovers which structure,"* **not** *"production-grade fraud detection."*
 
 ---
 
@@ -135,10 +175,10 @@ Beyond the production classifier, the project carries a complete categorical inf
 
 ```bash
 git clone https://github.com/vybhav72954/cross-border-fraud.git
-cd cross-border-credit
+cd cross-border-fraud
 
 pip install pandas numpy scipy statsmodels scikit-learn matplotlib seaborn \
-            jupyterlab networkx xgboost lightgbm tabpfn
+            jupyterlab tqdm pyarrow
 
 # PyTorch — CPU build
 pip install torch --index-url https://download.pytorch.org/whl/cpu
@@ -153,13 +193,21 @@ pip install torch-geometric
 ```bash
 # Requires ~/.kaggle/kaggle.json  (Kaggle → Account → Create API Token)
 pip install kaggle
-kaggle datasets download -d kartik2112/fraud-detection \
-  -p data/raw --unzip
+kaggle datasets download -d kartik2112/fraud-detection -p data/raw --unzip
 ```
 
 Produces `data/raw/fraudTrain.csv` and `data/raw/fraudTest.csv` (~250 MB total).
 
-### 3. Run notebooks in order
+### 3. Build the controlled dataset and run the bake-off
+
+```bash
+python build_injected_dataset.py   # → data/processed/injected_{train,test}.parquet
+python run_glm_baseline.py         # tabular reference grid (the line to beat)
+python run_gnn_ring.py             # windowed fan-in + RingSAGE + LR-test gate (ring)
+python run_ssm_temporal.py         # hour-rarity + TemporalSSM + LR-test gate (temporal)
+```
+
+### 4. Notebooks
 
 ```bash
 jupyter lab
@@ -168,70 +216,58 @@ jupyter lab
 | # | Notebook | What it does |
 |---|---|---|
 | 01 | `01_eda` | Schema validation, distributions, imbalance audit |
-| 02 | `02_label_engineering` | Derives all 5 labels · saves processed parquets ⚠️ run first |
+| 02 | `02_label_engineering` | Derives the rule-based labels · saves processed parquets ⚠️ run first |
 | 03 | `03_cda_contingency` | χ², Cramér's V, odds ratios, Mantel–Haenszel, label co-occurrence |
-| 04 | `04_glm_binary_relevance` | Production model · OR tables · calibration · multi-label metrics |
-| 05 | `05_log_linear` | Log-linear on feature tables + 32-cell label joint distribution |
-| 06 | `06_gnn` | Graph construction · GraphSAGE · LR-test admission |
-| 07 | `07_mamba` | Per-card SSM · temporal features · LR-test admission |
-| 08 | `08_benchmark` | Full leaderboard: GLM vs XGBoost vs TabPFN |
+| 04 | `04_glm_binary_relevance` | Rule-label GLM · OR tables · calibration · multi-label metrics |
+| 05 | `05_log_linear` | Log-linear on feature tables + the 32-cell label joint distribution |
+| 06 | `06_gnn` | **Ring slot:** windowed merchant fan-in · RingSAGE · LR-test admission |
+| 07 | `07_mamba` | **Temporal slot:** card-relative hour-rarity · TemporalSSM · LR-test admission |
+| 08 | `08_benchmark` | **Bake-off summary:** the full grid + tabular→learned→oracle comparison |
 
 ---
 
 ## Project structure
 
 ```
-cross-border-credit/
+cross-border-fraud/
 ├── data/
-│   ├── raw/                    # fraudTrain.csv, fraudTest.csv  (gitignored)
-│   └── processed/              # labeled parquets, GNN/SSM features
+│   ├── raw/                       # fraudTrain.csv, fraudTest.csv  (gitignored)
+│   └── processed/                 # labeled + injected parquets   (gitignored)
 ├── notebooks/
-│   ├── 01_eda.ipynb
-│   ├── 02_label_engineering.ipynb
-│   ├── 03_cda_contingency.ipynb
-│   ├── 04_glm_binary_relevance.ipynb
-│   ├── 05_log_linear.ipynb
-│   ├── 06_gnn.ipynb
-│   ├── 07_mamba.ipynb
-│   └── 08_benchmark.ipynb
+│   ├── 01_eda.ipynb … 05_log_linear.ipynb   # data + statistical-inference layer
+│   ├── 06_gnn.ipynb               # ring slot deep-dive
+│   ├── 07_mamba.ipynb             # temporal slot deep-dive
+│   └── 08_benchmark.ipynb         # bake-off summary
 ├── src/
-│   ├── labels.py               # derive_labels() — rule-based, pre-model
-│   ├── features.py             # GLM design matrix construction
-│   ├── evaluation.py           # multi-label metrics · LR test · H-L calibration
+│   ├── inject.py                  # controlled fraud injection + answer-key readers
+│   ├── labels.py                  # derive_labels() — rule-based, pre-model
+│   ├── features.py                # GLM design-matrix construction
+│   ├── evaluation.py              # multi-label metrics · LR test · H-L calibration
 │   └── models/
-│       ├── glm.py              # BinaryRelevanceGLM + companion models
-│       ├── gnn.py              # CardMerchantSAGE + bipartite graph builder
-│       └── ssm.py              # MambaExtractor + DiscretizedSSM (CPU fallback)
-├── Technical_Design_Document.md
-├── CLAUDE.md
+│       ├── glm.py                 # BinaryRelevanceGLM (+ companion models) + LR-test gate
+│       ├── gnn.py                 # merchant_window_features + RingSAGE
+│       └── ssm.py                 # card_hour_rarity + TemporalSSM
+├── build_injected_dataset.py      # builds the controlled dataset
+├── run_glm_baseline.py            # tabular reference grid
+├── run_gnn_ring.py                # GNN ring slot + LR-test gate
+├── run_ssm_temporal.py            # SSM temporal slot + LR-test gate
 ├── requirements.txt
 └── pyproject.toml
 ```
 
 ---
 
-## Benchmark
-
-*Fill in after running `08_benchmark.ipynb`.*
-
-| System | Hamming loss ↓ | Subset accuracy ↑ | Label ranking AP ↑ | Mean AUC ↑ |
-|---|---|---|---|---|
-| GLM — classical features | — | — | — | — |
-| GLM + GNN + Mamba | — | — | — | — |
-| XGBoost (binary relevance) | — | — | — | — |
-| TabPFN (subsampled) | — | — | — | — |
-
----
-
 ## Key design invariants
 
-**Labels before models.** All label thresholds are fixed constants in `src/labels.py` and declared before any training run. No model output informs a label assignment.
+**Plant, don't detect.** Fraud is injected with known signatures so detectors can be scored against an answer key; injected rows match the legit distribution on every axis except the intended signature.
 
-**GLM is always the classifier.** GNN and Mamba change what goes into `X`; they never replace the logit. Odds ratios, Wald tests, and Hosmer–Lemeshow calibration are reported for every label regardless of which extensions are admitted.
+**Labels before models.** Rule-based label thresholds are fixed constants in `src/labels.py`, declared before any training run. No model output informs a label.
 
-**LR test is the gate, per label.** An extension admitted for `L_R` (ring) is not automatically admitted for `L_G` (geography). Each label gets its own nested test.
+**GLM is always the classifier.** GNN and SSM change what goes into `X`; they never replace the logit. Odds ratios, Wald tests, and Hosmer–Lemeshow calibration are reported for every label.
 
-**Binary relevance, not power-set.** Five independent logits are the production model. The power-set multinomial over top-*M* label combinations is a companion analysis only.
+**LR test is the gate, per label.** An extension admitted for `ring` is not automatically admitted for `geo`. Each label gets its own nested test.
+
+**Binary relevance, not power-set.** Independent binary logits are the production model. The power-set multinomial over top-*M* combinations is a companion analysis only.
 
 ---
 
@@ -240,14 +276,13 @@ cross-border-credit/
 - Agresti, A. *Categorical Data Analysis*, 3rd ed. Wiley (2013)
 - Hamilton, Ying & Leskovec. *Inductive Representation Learning on Large Graphs.* NeurIPS 2017
 - Veličković et al. *Graph Attention Networks.* ICLR 2018
+- Gu, Goel & Ré. *Efficiently Modeling Long Sequences with Structured State Spaces (S4).* ICLR 2022
 - Gu & Dao. *Mamba: Linear-Time Sequence Modeling with Selective State Spaces.* arXiv 2312.00752 (2023)
-- Gorishniy et al. *Revisiting Deep Learning Models for Tabular Data.* NeurIPS 2021
-- Hollmann et al. *Accurate predictions on small data with a tabular foundation model.* Nature 637 (2025)
 - Read et al. *Classifier Chains for Multi-Label Classification.* Machine Learning 85 (2011)
 - Zhang & Zhou. *A Review on Multi-Label Learning Algorithms.* IEEE TKDE 26(8) (2014)
 
 ---
 
 <div align="center">
-<sub>Dataset: Sparkov CC0 &nbsp;·&nbsp; Statistical core: statsmodels &nbsp;·&nbsp; Graph: PyTorch Geometric &nbsp;·&nbsp; Sequences: Mamba / SSM</sub>
+<sub>Dataset: Sparkov CC0 &nbsp;·&nbsp; Statistical core: statsmodels &nbsp;·&nbsp; Graph: PyTorch Geometric &nbsp;·&nbsp; Sequences: fixed-A diagonal SSM</sub>
 </div>

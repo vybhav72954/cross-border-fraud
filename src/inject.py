@@ -14,11 +14,12 @@ Typologies (one injector each, with the representation that should catch it):
   category  a transaction in one of the card's rarest categories  (tabular  -> GLM)
   geo       a merchant placed implausibly far from the card's home (tabular  -> GLM)
 
-Geography: real Sparkov places merchant coords *near the cardholder*, so every
-injected row draws its merchant offset from the legit home->merchant
-distribution and is geographically indistinguishable from legit — EXCEPT `geo`,
-which places the merchant far away. (Without this, copying a merchant's location
-onto a different card's home makes all injected fraud look geo-anomalous.)
+Controlled-benchmark invariant: injected rows match the legit distribution on
+EVERY axis except the intended signature, so a detector can only succeed via the
+real signal. Concretely: `amt` and the event timestamp are sampled from the
+legit pools (no fraud-vs-legit or per-typology giveaway); merchant coords use
+the legit home->merchant offset distribution (except `geo`, placed far); time is
+a real legit timestamp (except `temporal`, whose hour is deliberately rare).
 
 Overlap: `inject_overlap` stamps TWO compatible signatures on one event, so a
 fraud carries >=2 typologies — the ground-truth source of `cross_border`. The
@@ -60,14 +61,15 @@ def legit_background(df: pd.DataFrame) -> pd.DataFrame:
 # ── sampling pools & per-signature helpers ──────────────────────────────────
 
 def _pools(base: pd.DataFrame):
-    """Pools drawn from legit rows only (safe under chaining)."""
+    """Identity/merchant/amount/time pools drawn from legit rows only
+    (safe under chaining)."""
     legit = base.loc[base[TYPOLOGY_COL] == ""]
     template = legit.drop_duplicates("cc_num", keep="first").set_index("cc_num")
     merch_loc = legit.drop_duplicates("merchant", keep="first").set_index("merchant")
-    t_min = legit["trans_date_trans_time"].min()
-    t_max = legit["trans_date_trans_time"].max()
     return (legit, template, merch_loc, template.index.to_numpy(),
-            merch_loc.index.to_numpy(), t_min, t_max)
+            merch_loc.index.to_numpy(),
+            legit["amt"].to_numpy(),
+            legit["trans_date_trans_time"].to_numpy())
 
 
 def _offset_pool(legit: pd.DataFrame):
@@ -88,6 +90,14 @@ def _far_loc(home, min_offset_deg, rng):
     return float(home["lat"] + d * np.cos(ang)), float(home["long"] + d * np.sin(ang))
 
 
+def _rand_amt(amt_pool, rng) -> float:
+    return float(amt_pool[int(rng.integers(0, amt_pool.shape[0]))])
+
+
+def _rand_time(time_pool, rng) -> pd.Timestamp:
+    return pd.Timestamp(time_pool[int(rng.integers(0, time_pool.shape[0]))])
+
+
 def _hour_counts(legit: pd.DataFrame) -> pd.Series:
     return (legit.assign(_h=legit["trans_date_trans_time"].dt.hour)
             .groupby(["cc_num", "_h"]).size())
@@ -101,6 +111,22 @@ def _rare_hour(hour_counts, c, all_hours, k, rng) -> int:
 def _rare_category(cat_counts, c, all_cats, k, rng):
     cc = cat_counts.loc[c].reindex(all_cats, fill_value=0)
     return rng.choice(cc.nsmallest(k).index.to_numpy())
+
+
+def _rare_for_card_common_globally(cat_counts, global_freq, c, all_cats, k, top_g, rng):
+    """A category rare FOR THIS CARD but among the ``top_g`` globally most common.
+
+    The plain rare-category signature degenerates because rare-for-card is almost
+    always rare-globally too, so a global one-hot dummy already flags it. Picking
+    a category the card barely uses yet everyone else uses heavily makes the
+    anomaly purely card-relative -- invisible to a global dummy, recoverable only
+    by a card-conditioned model. Falls back to plain rarest if a card has no rare
+    common category."""
+    cc = cat_counts.loc[c].reindex(all_cats, fill_value=0)
+    common = global_freq.nlargest(top_g).index
+    cand = cc.loc[cc.index.isin(common)].nsmallest(k)
+    pool = cand.index.to_numpy() if len(cand) else cc.nsmallest(k).index.to_numpy()
+    return rng.choice(pool)
 
 
 def _row(template, c, t, amt, typology, event, trans_num, merchant, merch_loc,
@@ -134,18 +160,17 @@ def inject_ring(base, n_rings, cards_per_ring=5, window_hours=2.0, rng=None):
     """`cards_per_ring` distinct cards at one shared merchant inside
     `window_hours` — the card->merchant fan-in a graph model should see."""
     rng = rng if rng is not None else np.random.default_rng()
-    legit, template, merch_loc, cards, merchants, t_min, t_max = _pools(base)
+    legit, template, merch_loc, cards, merchants, amt_pool, time_pool = _pools(base)
     off_lat, off_long = _offset_pool(legit)
-    span_s = (t_max - t_min - pd.Timedelta(hours=window_hours)).total_seconds()
     rows = []
     for r in range(n_rings):
         m = rng.choice(merchants)
-        t0 = t_min + pd.Timedelta(seconds=float(rng.uniform(0, span_s)))
+        t0 = _rand_time(time_pool, rng)
         for c in rng.choice(cards, size=cards_per_ring, replace=False):
             home = template.loc[c]
             lat, lon = _near_loc(home, off_lat, off_long, rng)
             t = t0 + pd.Timedelta(hours=float(rng.uniform(0, window_hours)))
-            rows.append(_row(template, c, t, rng.uniform(200, 1000), "ring",
+            rows.append(_row(template, c, t, _rand_amt(amt_pool, rng), "ring",
                              f"ring_{r:04d}", f"INJ_ring_{r:04d}_{c}", m, merch_loc, lat, lon))
     return _finalize(base, rows)
 
@@ -153,29 +178,28 @@ def inject_ring(base, n_rings, cards_per_ring=5, window_hours=2.0, rng=None):
 def inject_velocity(base, n_events, txn_per_burst=5, window_minutes=20.0, rng=None):
     """One card firing `txn_per_burst` transactions inside `window_minutes`."""
     rng = rng if rng is not None else np.random.default_rng()
-    legit, template, merch_loc, cards, merchants, t_min, t_max = _pools(base)
+    legit, template, merch_loc, cards, merchants, amt_pool, time_pool = _pools(base)
     off_lat, off_long = _offset_pool(legit)
-    span_s = (t_max - t_min - pd.Timedelta(minutes=window_minutes)).total_seconds()
     rows = []
     for e in range(n_events):
         c = rng.choice(cards)
         home = template.loc[c]
-        t0 = t_min + pd.Timedelta(seconds=float(rng.uniform(0, span_s)))
+        t0 = _rand_time(time_pool, rng)
         for j in range(txn_per_burst):
             lat, lon = _near_loc(home, off_lat, off_long, rng)
             t = t0 + pd.Timedelta(minutes=float(rng.uniform(0, window_minutes)))
-            rows.append(_row(template, c, t, rng.uniform(50, 500), "velocity",
+            rows.append(_row(template, c, t, _rand_amt(amt_pool, rng), "velocity",
                              f"velocity_{e:05d}", f"INJ_velocity_{e:05d}_{j}",
                              rng.choice(merchants), merch_loc, lat, lon))
     return _finalize(base, rows)
 
 
 def inject_temporal(base, n_events, rarest_k=5, rng=None):
-    """A transaction at one of the card's `rarest_k` least-used hours-of-day."""
+    """A transaction at one of the card's `rarest_k` least-used hours-of-day
+    (date sampled from legit, only the hour is anomalous)."""
     rng = rng if rng is not None else np.random.default_rng()
-    legit, template, merch_loc, cards, merchants, t_min, t_max = _pools(base)
+    legit, template, merch_loc, cards, merchants, amt_pool, time_pool = _pools(base)
     off_lat, off_long = _offset_pool(legit)
-    n_days = max((t_max - t_min).days, 1)
     hour_counts = _hour_counts(legit)
     all_hours = pd.RangeIndex(24)
     rows = []
@@ -184,22 +208,27 @@ def inject_temporal(base, n_events, rarest_k=5, rng=None):
         home = template.loc[c]
         lat, lon = _near_loc(home, off_lat, off_long, rng)
         h = _rare_hour(hour_counts, c, all_hours, rarest_k, rng)
-        day = t_min.normalize() + pd.Timedelta(days=int(rng.integers(0, n_days)))
-        t = day + pd.Timedelta(hours=h, minutes=int(rng.integers(0, 60)))
-        rows.append(_row(template, c, t, rng.uniform(100, 800), "temporal",
+        t = _rand_time(time_pool, rng).normalize() + pd.Timedelta(hours=h, minutes=int(rng.integers(0, 60)))
+        rows.append(_row(template, c, t, _rand_amt(amt_pool, rng), "temporal",
                          f"temporal_{e:05d}", f"INJ_temporal_{e:05d}_{c}",
                          rng.choice(merchants), merch_loc, lat, lon))
     return _finalize(base, rows)
 
 
-def inject_category(base, n_events, rarest_k=3, rng=None):
-    """A transaction in one of the card's `rarest_k` least-used categories."""
+def inject_category(base, n_events, rarest_k=3, globally_common_only=False,
+                    global_common_k=5, rng=None):
+    """A transaction in one of the card's `rarest_k` least-used categories.
+
+    With ``globally_common_only`` the rare-for-card category is additionally
+    constrained to the ``global_common_k`` most common categories overall, so the
+    signal is purely card-relative (a global one-hot dummy can't catch it). See
+    ``_rare_for_card_common_globally``."""
     rng = rng if rng is not None else np.random.default_rng()
-    legit, template, merch_loc, cards, merchants, t_min, t_max = _pools(base)
+    legit, template, merch_loc, cards, merchants, amt_pool, time_pool = _pools(base)
     off_lat, off_long = _offset_pool(legit)
-    span_s = (t_max - t_min).total_seconds()
     all_cats = pd.Index(sorted(legit["category"].unique()))
     cat_counts = legit.groupby(["cc_num", "category"]).size()
+    global_freq = legit.groupby("category").size() if globally_common_only else None
     merch_by_cat = {cat: merch_loc.index[merch_loc["category"] == cat].to_numpy()
                     for cat in all_cats}
     rows = []
@@ -207,9 +236,12 @@ def inject_category(base, n_events, rarest_k=3, rng=None):
         c = rng.choice(cards)
         home = template.loc[c]
         lat, lon = _near_loc(home, off_lat, off_long, rng)
-        cat = _rare_category(cat_counts, c, all_cats, rarest_k, rng)
-        t = t_min + pd.Timedelta(seconds=float(rng.uniform(0, span_s)))
-        rows.append(_row(template, c, t, rng.uniform(100, 800), "category",
+        cat = (_rare_for_card_common_globally(cat_counts, global_freq, c, all_cats,
+                                              rarest_k, global_common_k, rng)
+               if globally_common_only
+               else _rare_category(cat_counts, c, all_cats, rarest_k, rng))
+        t = _rand_time(time_pool, rng)
+        rows.append(_row(template, c, t, _rand_amt(amt_pool, rng), "category",
                          f"category_{e:05d}", f"INJ_category_{e:05d}_{c}",
                          rng.choice(merch_by_cat[cat]), merch_loc, lat, lon, category=cat))
     return _finalize(base, rows)
@@ -218,15 +250,14 @@ def inject_category(base, n_events, rarest_k=3, rng=None):
 def inject_geo(base, n_events, min_offset_deg=8.0, rng=None):
     """A merchant placed `min_offset_deg`+ degrees (~900+ km) from the card's home."""
     rng = rng if rng is not None else np.random.default_rng()
-    _, template, merch_loc, cards, merchants, t_min, t_max = _pools(base)
-    span_s = (t_max - t_min).total_seconds()
+    legit, template, merch_loc, cards, merchants, amt_pool, time_pool = _pools(base)
     rows = []
     for e in range(n_events):
         c = rng.choice(cards)
         home = template.loc[c]
         lat, lon = _far_loc(home, min_offset_deg, rng)
-        t = t_min + pd.Timedelta(seconds=float(rng.uniform(0, span_s)))
-        rows.append(_row(template, c, t, rng.uniform(100, 800), "geo",
+        t = _rand_time(time_pool, rng)
+        rows.append(_row(template, c, t, _rand_amt(amt_pool, rng), "geo",
                          f"geo_{e:05d}", f"INJ_geo_{e:05d}_{c}",
                          rng.choice(merchants), merch_loc, lat, lon))
     return _finalize(base, rows)
@@ -244,10 +275,8 @@ def inject_overlap(base, combo_counts=None, *, cards_per_ring=5, ring_window_hou
     (geo/temporal/category)."""
     rng = rng if rng is not None else np.random.default_rng()
     combo_counts = combo_counts if combo_counts is not None else DEFAULT_OVERLAP
-    legit, template, merch_loc, cards, merchants, t_min, t_max = _pools(base)
+    legit, template, merch_loc, cards, merchants, amt_pool, time_pool = _pools(base)
     off_lat, off_long = _offset_pool(legit)
-    span_s = (t_max - t_min).total_seconds()
-    n_days = max((t_max - t_min).days, 1)
     hour_counts = _hour_counts(legit)
     all_hours = pd.RangeIndex(24)
     all_cats = pd.Index(sorted(legit["category"].unique()))
@@ -258,9 +287,9 @@ def inject_overlap(base, combo_counts=None, *, cards_per_ring=5, ring_window_hou
     def pick_time(c, mods):
         if "temporal" in mods:
             h = _rare_hour(hour_counts, c, all_hours, temporal_rarest_k, rng)
-            day = t_min.normalize() + pd.Timedelta(days=int(rng.integers(0, n_days)))
-            return day + pd.Timedelta(hours=h, minutes=int(rng.integers(0, 60)))
-        return t_min + pd.Timedelta(seconds=float(rng.uniform(0, span_s)))
+            return _rand_time(time_pool, rng).normalize() + pd.Timedelta(
+                hours=h, minutes=int(rng.integers(0, 60)))
+        return _rand_time(time_pool, rng)
 
     def pick_merchant(c, mods):
         if "category" in mods:
@@ -283,12 +312,12 @@ def inject_overlap(base, combo_counts=None, *, cards_per_ring=5, ring_window_hou
             eid += 1
             if "ring" in mods:
                 m = rng.choice(merchants)
-                t0 = t_min + pd.Timedelta(seconds=float(rng.uniform(0, span_s)))
+                t0 = _rand_time(time_pool, rng)
                 for c in rng.choice(cards, size=cards_per_ring, replace=False):
                     home = template.loc[c]
                     lat, lon = pick_loc(home, mods)
                     t = t0 + pd.Timedelta(hours=float(rng.uniform(0, ring_window_hours)))
-                    rows.append(_row(template, c, t, rng.uniform(200, 1000), tag,
+                    rows.append(_row(template, c, t, _rand_amt(amt_pool, rng), tag,
                                      event, f"INJ_{event}_{c}", m, merch_loc, lat, lon))
             elif "velocity" in mods:
                 c = rng.choice(cards)
@@ -298,7 +327,7 @@ def inject_overlap(base, combo_counts=None, *, cards_per_ring=5, ring_window_hou
                     m, cat = pick_merchant(c, mods)
                     lat, lon = pick_loc(home, mods)
                     t = t0 + pd.Timedelta(minutes=float(rng.uniform(0, velocity_window_minutes)))
-                    rows.append(_row(template, c, t, rng.uniform(50, 500), tag,
+                    rows.append(_row(template, c, t, _rand_amt(amt_pool, rng), tag,
                                      event, f"INJ_{event}_{j}", m, merch_loc, lat, lon, category=cat))
             else:
                 c = rng.choice(cards)
@@ -306,7 +335,7 @@ def inject_overlap(base, combo_counts=None, *, cards_per_ring=5, ring_window_hou
                 t = pick_time(c, mods)
                 m, cat = pick_merchant(c, mods)
                 lat, lon = pick_loc(home, mods)
-                rows.append(_row(template, c, t, rng.uniform(100, 800), tag,
+                rows.append(_row(template, c, t, _rand_amt(amt_pool, rng), tag,
                                  event, f"INJ_{event}_{c}", m, merch_loc, lat, lon, category=cat))
     return _finalize(base, rows)
 

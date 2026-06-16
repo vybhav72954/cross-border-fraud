@@ -1,12 +1,26 @@
 """
-Mamba / State-Space Model feature extractor for temporal fraud signals (L_V, L_T).
+SSM / Mamba feature extractor for the temporal (L_T) signal.
 
-Each card's transaction history is treated as a time-ordered sequence.
-The final SSM hidden state is the per-card behavioral embedding, reduced
-to interpretable scalars for the GLM design matrix.
+The temporal signature is a transaction at one of the CARD'S rarest hours-of-day
+(see ``inject_temporal``) -- a per-card anomaly. Global ``hour_sin``/``hour_cos``
+can only express the wall-clock hour, not "rare FOR THIS CARD", so the tabular
+baseline tops out around 0.70. A state-space model scanning one sequence per
+card accumulates that card's timing profile in its hidden state and scores each
+transaction by how out-of-distribution its hour is. The signal is
+PER-TRANSACTION, so this emits a per-token score.
 
-GPU path: mamba-ssm (install separately, requires CUDA 12+)
-CPU path: discretized SSM implemented in numpy/torch
+Two signals, mirroring the GNN ring slot:
+  * ``card_hour_rarity`` -- per transaction, 1 - the card's historical share of
+    this hour-of-day (high = anomalous). The interpretable oracle feature; what
+    the SSM should learn. Fast, no torch.
+  * ``TemporalSSM`` -- a discretized DIAGONAL SSM, S4D/HiPPO-style: the state is
+    a bank of causal exponential-moving-average histograms of the hour-of-day at
+    FIXED multi-timescale decays (the diagonal ``A``), and only the readout is
+    learned (a small MLP head). Fixing ``A`` lets the states be precomputed once
+    with ``scipy.signal.lfilter`` -- no backprop through time, so it trains in
+    seconds on CPU instead of grad-through-time over ~1300-long sequences. The
+    head still has to LEARN to read the current hour's habituality out of the
+    decayed histogram; the rarity is never handed in as a feature.
 """
 
 from __future__ import annotations
@@ -15,214 +29,496 @@ import numpy as np
 import pandas as pd
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
+from scipy.signal import lfilter
+
+try:
+    from tqdm.auto import tqdm
+except ImportError:  # pragma: no cover
+    def tqdm(x, **kwargs):
+        return x
+
+TIME_COL = "trans_date_trans_time"
+N_HOURS = 24
+DECAYS = (0.95, 0.99, 0.999)  # diagonal-A timescales: ~20 / ~100 / ~1000 txns
 
 
-class DiscretizedSSM(nn.Module):
-    """Simple discretized linear SSM — CPU-compatible fallback.
+# ── interpretable oracle: per-card hour rarity ──────────────────────────────
 
-    h_t = A_bar * h_{t-1} + B_bar * x_t
-    y_t = C * h_t
+def card_hour_rarity(df: pd.DataFrame, time_col: str = TIME_COL) -> pd.Series:
+    """Per transaction: 1 - the cardholder's share of this hour-of-day.
 
-    A_bar, B_bar derived from continuous A, B via zero-order hold.
+    A card that never (rarely) transacts at hour h gets ~1.0 here for a txn at
+    hour h; its habitual hours sit near 0. The card-relative timing feature the
+    global hour_sin/cos cannot express, and the quantity the SSM must recover.
+    """
+    hour = pd.to_datetime(df[time_col]).dt.hour
+    cc = df["cc_num"]
+    pair = cc.astype(str) + "_" + hour.astype(str)
+    pair_n = pair.map(pair.value_counts())
+    card_n = cc.map(cc.value_counts())
+    return (1.0 - pair_n / card_n).astype(float)
+
+
+# ── diagonal-SSM states: causal decayed hour-histograms ─────────────────────
+
+def _sorted_groups(df: pd.DataFrame, time_col: str):
+    dt = pd.to_datetime(df[time_col])
+    t_ns = dt.to_numpy().astype("datetime64[ns]").astype(np.int64)
+    card = pd.factorize(df["cc_num"])[0]
+    order = np.lexsort((t_ns, card))  # primary card, secondary time
+    cs = card[order]
+    bounds = np.flatnonzero(np.diff(cs)) + 1
+    starts = np.concatenate(([0], bounds))
+    ends = np.concatenate((bounds, [len(df)]))
+    return order, starts, ends, dt
+
+
+def hour_ema_states(df: pd.DataFrame, decays=DECAYS, time_col: str = TIME_COL) -> np.ndarray:
+    """Per transaction, the card's CAUSAL decayed hour-histogram at each decay.
+
+    For decay ``a``: h_t = a*h_{t-1} + (1-a)*onehot(hour_t), read BEFORE the
+    current token (profile of strictly-earlier txns of the same card). Computed
+    per card with ``scipy.signal.lfilter`` (fixed diagonal A => no grad-through-
+    time). Returns (n, len(decays)*N_HOURS), aligned to df rows.
+    """
+    n = len(df)
+    order, starts, ends, dt = _sorted_groups(df, time_col)
+    hour = dt.dt.hour.to_numpy()
+    oh = np.zeros((n, N_HOURS), dtype=np.float64)
+    oh[np.arange(n), hour] = 1.0
+    oh_s = oh[order]
+
+    feats = np.zeros((n, len(decays) * N_HOURS), dtype=np.float32)
+    for di, a in enumerate(decays):
+        b, aa = [1.0 - a], [1.0, -a]
+        col = di * N_HOURS
+        block = np.zeros((n, N_HOURS), dtype=np.float64)
+        for s, e in zip(starts, ends):
+            filt = lfilter(b, aa, oh_s[s:e], axis=0)  # EMA incl. current token
+            block[s + 1:e] = filt[:-1]                # shift -> strictly-earlier
+        feats[order, col:col + N_HOURS] = block.astype(np.float32)
+    return feats
+
+
+# ── learned readout over the SSM states ─────────────────────────────────────
+
+class _ReadoutMLP(nn.Module):
+    """Per-token readout from a fixed-state SSM's features -> typology logit.
+
+    Must learn to gather the relevant quantity (the current hour's habituality
+    for temporal; the local arrival rate for velocity) out of the state bank;
+    the answer is never handed in directly.
     """
 
-    def __init__(self, d_input: int = 6, d_state: int = 32) -> None:
+    def __init__(self, d_in: int, hidden: int = 64):
         super().__init__()
-        self.d_state = d_state
-        self.d_input = d_input
+        self.net = nn.Sequential(
+            nn.Linear(d_in, hidden), nn.ReLU(),
+            nn.Linear(hidden, hidden), nn.ReLU(),
+            nn.Linear(hidden, 1),
+        )
 
-        # Continuous-time parameters (learnable)
-        self.A = nn.Parameter(torch.randn(d_state, d_state) * 0.01)
-        self.B = nn.Parameter(torch.randn(d_state, d_input) * 0.01)
-        self.C = nn.Parameter(torch.randn(1, d_state) * 0.01)
-        self.log_delta = nn.Parameter(torch.zeros(1))  # log discretization step
-
-    def forward(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-        """
-        Parameters
-        ----------
-        x: (batch, seq_len, d_input)
-
-        Returns
-        -------
-        y:  (batch, seq_len, 1) — output sequence
-        h:  (batch, d_state)   — final hidden state (the behavioral embedding)
-        """
-        batch, seq_len, _ = x.shape
-        delta = torch.exp(self.log_delta)
-
-        # Zero-order hold discretization
-        A_bar = torch.matrix_exp(self.A * delta)
-        B_bar = torch.linalg.solve(self.A, (A_bar - torch.eye(self.d_state)) @ self.B)
-
-        h = torch.zeros(batch, self.d_state, device=x.device)
-        ys = []
-        for t in range(seq_len):
-            h = h @ A_bar.T + x[:, t, :] @ B_bar.T
-            y_t = h @ self.C.T
-            ys.append(y_t)
-
-        return torch.stack(ys, dim=1), h
+    def forward(self, x):
+        return self.net(x).squeeze(-1)
 
 
-def _build_card_sequences(df: pd.DataFrame, max_len: int = 256) -> tuple[np.ndarray, list]:
-    """Build (n_cards, max_len, d_input) input tensor from Sparkov per-card histories.
+def _fit_readout(X_np: np.ndarray, label, *, hidden: int, epochs: int, lr: float,
+                 batch: int, max_pos_weight: float, seed: int,
+                 desc: str = "readout train") -> _ReadoutMLP:
+    """Train the MLP readout over precomputed fixed-A SSM features.
 
-    Input features per token:
-      0: log inter-arrival seconds (or 0 for first transaction)
-      1: log(amt + 1)
-      2: merch_lat (normalized)
-      3: merch_long (normalized)
-      4: hour-of-day / 24 (cyclic sin)
-      5: hour-of-day / 24 (cyclic cos)
+    Shared by every fixed-state SSM slot (temporal, velocity): the states are
+    precomputed, so this is a plain class-weighted minibatch logistic fit -- no
+    backprop through time.
     """
-    df = df.copy()
-    df["trans_dt"] = pd.to_datetime(df["trans_date_trans_time"])
-    df = df.sort_values(["cc_num", "trans_dt"])
+    torch.manual_seed(seed)
+    X = torch.from_numpy(X_np)
+    y = torch.from_numpy(np.asarray(label).astype(np.float32))
+    pos = float(y.sum())
+    pos_w = torch.tensor([min((len(y) - pos) / max(pos, 1.0), max_pos_weight)])
 
-    lat_mean, lat_std = df["merch_lat"].mean(), df["merch_lat"].std() + 1e-8
-    lon_mean, lon_std = df["merch_long"].mean(), df["merch_long"].std() + 1e-8
+    model = _ReadoutMLP(X.shape[1], hidden)
+    opt = torch.optim.Adam(model.parameters(), lr=lr)
+    rng = np.random.default_rng(seed)
+    n = len(y)
 
-    cards = df["cc_num"].unique().tolist()
-    n_cards = len(cards)
-    d = 6
-    X = np.zeros((n_cards, max_len, d), dtype=np.float32)
-
-    for i, cc in enumerate(cards):
-        g = df[df["cc_num"] == cc].reset_index(drop=True)
-        n = min(len(g), max_len)
-        times = g["trans_dt"].values
-
-        for t in range(n):
-            if t == 0:
-                iat = 0.0
-            else:
-                diff = (times[t] - times[t - 1]) / np.timedelta64(1, "s")
-                iat = np.log1p(max(diff, 0))
-            hour = g.at[t, "trans_dt"].hour if hasattr(g.at[t, "trans_dt"], "hour") else pd.Timestamp(times[t]).hour
-            X[i, t, 0] = iat
-            X[i, t, 1] = np.log1p(g.at[t, "amt"])
-            X[i, t, 2] = (g.at[t, "merch_lat"] - lat_mean) / lat_std
-            X[i, t, 3] = (g.at[t, "merch_long"] - lon_mean) / lon_std
-            X[i, t, 4] = np.sin(2 * np.pi * hour / 24)
-            X[i, t, 5] = np.cos(2 * np.pi * hour / 24)
-
-    return X, cards
+    model.train()
+    for _ in tqdm(range(epochs), desc=desc):
+        perm = rng.permutation(n)
+        for i in range(0, n, batch):
+            idx = torch.from_numpy(perm[i:i + batch])
+            opt.zero_grad()
+            loss = F.binary_cross_entropy_with_logits(
+                model(X[idx]), y[idx], pos_weight=pos_w)
+            loss.backward()
+            opt.step()
+    return model
 
 
-class MambaExtractor:
-    """Train the SSM and extract per-card scalar features for the GLM.
+def _score_readout(model: _ReadoutMLP, X_np: np.ndarray) -> np.ndarray:
+    model.eval()
+    with torch.no_grad():
+        return torch.sigmoid(model(torch.from_numpy(X_np))).numpy()
 
-    Features handed to the GLM:
-      ssm_emb_mean   — mean of final hidden state
-      ssm_emb_std    — std of final hidden state
-      ssm_emb_max    — max activation
-      ssm_burst_score — scalar head: P(L_V=1 | embedding)
-      ssm_timing_score — scalar head: P(L_T=1 | embedding)
-    """
 
-    def __init__(self, d_state: int = 32, epochs: int = 20,
-                 lr: float = 1e-3, batch_size: int = 64,
-                 max_seq_len: int = 256) -> None:
-        self.d_state = d_state
+class TemporalSSM:
+    """Fixed-A diagonal SSM (decayed hour-histograms) + learned MLP readout."""
+
+    def __init__(self, decays=DECAYS, hidden: int = 64, epochs: int = 12,
+                 lr: float = 3e-3, batch: int = 16384, max_pos_weight: float = 50.0,
+                 seed: int = 0, time_col: str = TIME_COL) -> None:
+        self.decays = decays
+        self.hidden = hidden
         self.epochs = epochs
         self.lr = lr
-        self.batch_size = batch_size
-        self.max_seq_len = max_seq_len
-        self.ssm: DiscretizedSSM | None = None
-        self.burst_head: nn.Linear | None = None
-        self.timing_head: nn.Linear | None = None
+        self.batch = batch
+        self.max_pos_weight = max_pos_weight
+        self.seed = seed
+        self.time_col = time_col
+        self._model: _ReadoutMLP | None = None
+        self._cont_mean = np.zeros(2, dtype=np.float32)
+        self._cont_std = np.ones(2, dtype=np.float32)
 
-    def fit(self, df: pd.DataFrame) -> "MambaExtractor":
-        """Train SSM with reconstruction + label-prediction objectives."""
-        X_np, cards = _build_card_sequences(df, self.max_seq_len)
-        card_to_idx = {cc: i for i, cc in enumerate(cards)}
+    def _features(self, df: pd.DataFrame, fit_scaler: bool = False) -> np.ndarray:
+        """[decayed hour-histograms | current one-hot | z(logdt) | z(logamt)]."""
+        n = len(df)
+        states = hour_ema_states(df, self.decays, self.time_col)
 
-        # Per-card L_V and L_T labels (1 if any transaction in card is flagged)
-        card_labels = df.groupby("cc_num")[["L_V", "L_T"]].max()
+        order, starts, ends, dt = _sorted_groups(df, self.time_col)
+        hour = dt.dt.hour.to_numpy()
+        onehot = np.zeros((n, N_HOURS), dtype=np.float32)
+        onehot[np.arange(n), hour] = 1.0
 
-        self.ssm = DiscretizedSSM(d_input=6, d_state=self.d_state)
-        self.burst_head = nn.Linear(self.d_state, 1)
-        self.timing_head = nn.Linear(self.d_state, 1)
+        t_ns = dt.to_numpy().astype("datetime64[ns]").astype(np.int64)[order]
+        dsec = np.zeros(n, dtype=np.float64)
+        dsec[1:] = (t_ns[1:] - t_ns[:-1]) / 1e9
+        dsec[starts] = 0.0
+        logdt = np.zeros(n, dtype=np.float32)
+        logdt[order] = np.log1p(np.maximum(dsec, 0.0)).astype(np.float32)
+        logamt = np.log1p(df["amt"].to_numpy()).astype(np.float32)
+        cont = np.stack([logdt, logamt], axis=1)
 
-        params = (list(self.ssm.parameters()) +
-                  list(self.burst_head.parameters()) +
-                  list(self.timing_head.parameters()))
-        optimizer = torch.optim.Adam(params, lr=self.lr)
+        if fit_scaler:
+            self._cont_mean = cont.mean(axis=0)
+            self._cont_std = cont.std(axis=0)
+            self._cont_std[self._cont_std == 0] = 1.0
+        cont = (cont - self._cont_mean) / self._cont_std
+        return np.concatenate([states, onehot, cont], axis=1).astype(np.float32)
 
-        X_t = torch.tensor(X_np)
-        n = len(cards)
-
-        for epoch in range(self.epochs):
-            perm = torch.randperm(n)
-            epoch_loss = 0.0
-            for start in range(0, n, self.batch_size):
-                idx = perm[start:start + self.batch_size]
-                x_b = X_t[idx]
-                cc_b = [cards[i] for i in idx.tolist()]
-
-                optimizer.zero_grad()
-                y_hat, h = self.ssm(x_b)
-
-                # Reconstruction loss (predict next token)
-                recon_loss = nn.functional.mse_loss(y_hat[:, :-1, :],
-                                                     x_b[:, 1:, :1])
-
-                # Supervised heads where labels exist
-                lv = torch.tensor(
-                    [card_labels.loc[cc, "L_V"] if cc in card_labels.index else 0
-                     for cc in cc_b], dtype=torch.float32
-                ).unsqueeze(1)
-                lt = torch.tensor(
-                    [card_labels.loc[cc, "L_T"] if cc in card_labels.index else 0
-                     for cc in cc_b], dtype=torch.float32
-                ).unsqueeze(1)
-
-                burst_loss = nn.functional.binary_cross_entropy_with_logits(
-                    self.burst_head(h), lv
-                )
-                timing_loss = nn.functional.binary_cross_entropy_with_logits(
-                    self.timing_head(h), lt
-                )
-
-                loss = recon_loss + burst_loss + timing_loss
-                loss.backward()
-                optimizer.step()
-                epoch_loss += loss.item()
-
-            if (epoch + 1) % 5 == 0:
-                print(f"  Epoch {epoch+1}/{self.epochs}  loss={epoch_loss:.4f}")
-
-        self._X_np = X_np
-        self._cards = cards
+    def fit(self, df: pd.DataFrame, label: np.ndarray) -> "TemporalSSM":
+        self._model = _fit_readout(
+            self._features(df, fit_scaler=True), label, hidden=self.hidden,
+            epochs=self.epochs, lr=self.lr, batch=self.batch,
+            max_pos_weight=self.max_pos_weight, seed=self.seed,
+            desc="TemporalSSM train")
         return self
 
-    def extract_features(self, df: pd.DataFrame) -> pd.DataFrame:
-        """Return per-transaction scalar features mapped from card embeddings."""
-        assert self.ssm is not None, "Call fit() first."
+    def score(self, df: pd.DataFrame) -> np.ndarray:
+        """Per-transaction temporal-anomaly probability, aligned to df rows."""
+        return _score_readout(self._model, self._features(df, fit_scaler=False))
 
-        X_np, cards = _build_card_sequences(df, self.max_seq_len)
-        X_t = torch.tensor(X_np)
 
-        self.ssm.eval()
-        self.burst_head.eval()
-        self.timing_head.eval()
+# ── velocity SSM: continuous-time decayed arrival rate ──────────────────────
+#
+# The velocity signature is one card firing many transactions in a short window
+# (see ``inject_velocity``). The tabular GLM already nails it with a rolling 1h
+# count (~0.88), so this is the "neural matches, does not beat, tabular" slot:
+# the sequence view should *recover* the same rate signal, not exceed it.
+#
+# The SSM analogue of the rolling count is a leaky integrator of arrivals whose
+# decay depends on the elapsed time since the last event -- an INPUT-DEPENDENT
+# (selective, Mamba-like) diagonal A rather than the fixed per-token decay used
+# for temporal. In a burst the inter-arrival dt -> 0, so the decay -> 1 and
+# arrivals accumulate; between bursts a large dt collapses the state back toward
+# zero. Read strictly before the current token, the state is a smooth, multi-
+# timescale "how many transactions just preceded this one."
 
+RATE_DECAYS = (600.0, 3600.0, 86400.0)  # timescales in seconds: ~10 min / 1 h / 1 day
+
+
+def card_rate_states(df: pd.DataFrame, decays_sec=RATE_DECAYS,
+                     time_col: str = TIME_COL) -> np.ndarray:
+    """Per transaction, the card's CAUSAL time-decayed arrival count at each
+    timescale, read BEFORE the current token.
+
+    State recurrence per card, for timescale ``tau``:
+        h_t = exp(-dt_t / tau) * h_{t-1} + 1   (dt_t = inter-arrival time)
+    storing ``h`` *before* the current arrival is added, so a card's first txn
+    reads 0. The exp() is the continuous-time discretisation of a diagonal SSM
+    with input-dependent step; decays are precomputed (one vectorised exp), the
+    short sequential recurrence stays O(n). Returns (n, len(decays)), aligned to
+    df rows.
+    """
+    n = len(df)
+    taus = np.asarray(decays_sec, dtype=np.float64)
+    order, starts, ends, dt = _sorted_groups(df, time_col)
+    t_sec = (dt.to_numpy().astype("datetime64[ns]").astype(np.int64) / 1e9)[order]
+
+    dsec = np.zeros(n, dtype=np.float64)
+    dsec[1:] = t_sec[1:] - t_sec[:-1]
+    dsec[starts] = 0.0                           # cross-card gaps -> no decay carry-over
+    decay = np.exp(-dsec[:, None] / taus)        # (n, K)
+
+    block = np.zeros((n, len(taus)), dtype=np.float64)
+    for s, e in zip(starts, ends):
+        h = np.zeros(len(taus))
+        for i in range(s, e):
+            h = h * decay[i]
+            block[i] = h
+            h = h + 1.0
+    feats = np.zeros((n, len(taus)), dtype=np.float32)
+    feats[order] = block.astype(np.float32)
+    return feats
+
+
+class VelocitySSM:
+    """Continuous-time diagonal SSM (decayed arrival rate) + learned MLP readout.
+
+    Mirrors ``TemporalSSM`` -- fixed/closed-form states precomputed per card, only
+    the readout learned -- but the state is the time-decayed arrival count
+    (``card_rate_states``) instead of the hour histogram. The readout sees
+    [log decayed-rate bank | z(log dt) | z(log amt)] and must learn to read a
+    burst out of the rate bank; the rolling count is never handed in.
+    """
+
+    def __init__(self, decays_sec=RATE_DECAYS, hidden: int = 64, epochs: int = 25,
+                 lr: float = 3e-3, batch: int = 16384, max_pos_weight: float = 50.0,
+                 seed: int = 0, time_col: str = TIME_COL) -> None:
+        self.decays_sec = decays_sec
+        self.hidden = hidden
+        self.epochs = epochs
+        self.lr = lr
+        self.batch = batch
+        self.max_pos_weight = max_pos_weight
+        self.seed = seed
+        self.time_col = time_col
+        self._model: _ReadoutMLP | None = None
+        self._cont_mean = np.zeros(2, dtype=np.float32)
+        self._cont_std = np.ones(2, dtype=np.float32)
+
+    def _features(self, df: pd.DataFrame, fit_scaler: bool = False) -> np.ndarray:
+        """[log decayed-rate bank | z(log dt) | z(log amt)]."""
+        n = len(df)
+        log_states = np.log1p(card_rate_states(df, self.decays_sec, self.time_col))
+
+        order, starts, ends, dt = _sorted_groups(df, self.time_col)
+        t_ns = dt.to_numpy().astype("datetime64[ns]").astype(np.int64)[order]
+        dsec = np.zeros(n, dtype=np.float64)
+        dsec[1:] = (t_ns[1:] - t_ns[:-1]) / 1e9
+        dsec[starts] = 0.0
+        logdt = np.zeros(n, dtype=np.float32)
+        logdt[order] = np.log1p(np.maximum(dsec, 0.0)).astype(np.float32)
+        logamt = np.log1p(df["amt"].to_numpy()).astype(np.float32)
+        cont = np.stack([logdt, logamt], axis=1)
+
+        if fit_scaler:
+            self._cont_mean = cont.mean(axis=0)
+            self._cont_std = cont.std(axis=0)
+            self._cont_std[self._cont_std == 0] = 1.0
+        cont = (cont - self._cont_mean) / self._cont_std
+        return np.concatenate([log_states, cont], axis=1).astype(np.float32)
+
+    def fit(self, df: pd.DataFrame, label: np.ndarray) -> "VelocitySSM":
+        self._model = _fit_readout(
+            self._features(df, fit_scaler=True), label, hidden=self.hidden,
+            epochs=self.epochs, lr=self.lr, batch=self.batch,
+            max_pos_weight=self.max_pos_weight, seed=self.seed,
+            desc="VelocitySSM train")
+        return self
+
+    def score(self, df: pd.DataFrame) -> np.ndarray:
+        """Per-transaction velocity-burst probability, aligned to df rows."""
+        return _score_readout(self._model, self._features(df, fit_scaler=False))
+
+
+# ── selective (Mamba-S6-style) temporal SSM: LEARNED input-dependent decay ──
+#
+# The fixed-A TemporalSSM mixes a fixed bank of decay timescales and only the
+# readout is learned -- it tops out around 0.806 vs the 0.877 card_hour_rarity
+# oracle. A *selective* SSM (Mamba S6) instead lets the decay be a LEARNED,
+# input-dependent function of the token: a per-token step size dt_t modulates how
+# much of the past hour-histogram survives, so the model chooses how much history
+# to trust at each transaction. The input-dependent-dt VelocitySSM was a partial
+# down-payment (the gate there is the fixed exp(-dt/tau), not learned); here the
+# gate IS learned, end-to-end.
+#
+# Because the decay depends on the input AND ``A`` is learned, the states can no
+# longer be precomputed with ``lfilter`` -- it needs a scan with grad. We run the
+# scan batched across cards (pad to the longest sequence) with truncated BPTT to
+# bound CPU memory/time. State per channel is a causal hour-histogram read
+# strictly BEFORE the current token; the readout gathers the current hour's
+# accumulated share across channels (its OWN learned habituality estimate, not
+# the handed-in oracle) and maps it to a per-transaction logit.
+
+
+def _selective_init_A(decays, k: int) -> np.ndarray:
+    """A_raw such that ``-softplus(A_raw) == log(decay)`` (so at the init step
+    dt=1 the per-token decay equals each timescale in ``decays``)."""
+    dec = np.asarray(decays, dtype=np.float64)
+    if len(dec) < k:  # pad by repeating the slowest decay
+        dec = np.concatenate([dec, np.repeat(dec[-1], k - len(dec))])
+    dec = dec[:k]
+    a_pos = -np.log(dec)               # softplus output target (> 0)
+    return np.log(np.expm1(a_pos)).astype(np.float32)
+
+
+class _SelectiveSSMCore(nn.Module):
+    """One diagonal S6 channel-bank + targeted readout, stepped one token at a time.
+
+    Parameters learned: per-channel log-decay ``A`` (via ``A_raw``), the gate
+    projection ``(gate_w, gate_b)`` that turns per-token features into the step
+    ``dt_t``, and the readout MLP. The discretised decay is
+    ``exp(dt_t * A)`` with ``dt_t = softplus(gate)`` and ``A < 0`` -- the
+    selective (input-dependent) recurrence.
+    """
+
+    def __init__(self, n_channels: int, n_gate: int, hidden: int, decays):
+        super().__init__()
+        self.k = n_channels
+        self.A_raw = nn.Parameter(torch.from_numpy(_selective_init_A(decays, n_channels)))
+        self.gate_w = nn.Parameter(torch.zeros(n_gate))
+        self.gate_b = nn.Parameter(torch.tensor(0.5413))  # softplus(0.5413) ~= 1
+        self.readout = _ReadoutMLP(n_channels + n_gate, hidden)
+
+    def step(self, h: torch.Tensor, hour_t: torch.Tensor, x_t: torch.Tensor):
+        """Advance one token. ``h`` (C,K,24), ``hour_t`` (C,), ``x_t`` (C,n_gate).
+
+        Returns the updated state and the per-card logit for THIS token (read
+        from the state strictly before the current token is folded in).
+        """
+        A = -F.softplus(self.A_raw)                          # (K,) < 0
+        dt = F.softplus(x_t @ self.gate_w + self.gate_b)     # (C,) input-dependent
+        a = torch.exp(dt[:, None] * A[None, :])              # (C,K) in (0,1)
+        idx = hour_t.view(-1, 1, 1).expand(-1, self.k, 1)
+        share = h.gather(2, idx).squeeze(2)                  # (C,K) read-before
+        logit = self.readout(torch.cat([share, x_t], dim=1))
+        oh = F.one_hot(hour_t, N_HOURS).to(h.dtype)          # (C,24)
+        a3 = a[:, :, None]
+        h = a3 * h + (1.0 - a3) * oh[:, None, :]             # normalised EMA update
+        return h, logit
+
+
+class SelectiveTemporalSSM:
+    """Mamba-S6-style temporal SSM: learned input-dependent decay over a per-card
+    hour-histogram, scored per transaction.
+
+    Gate features per token are ``[z(log inter-arrival dt), z(log prior-count)]``
+    -- "how recent" and "how much history so far", the two quantities that should
+    govern how much of the card's hour profile to trust. ``A`` is initialised at
+    the fixed bank's timescales (so it starts at parity with ``TemporalSSM``) and
+    is free to move; the readout sees only the current hour's accumulated share
+    per channel plus those gate features -- the rarity is never handed in.
+    """
+
+    def __init__(self, n_channels: int = len(DECAYS), hidden: int = 64,
+                 epochs: int = 12, lr: float = 5e-3, tbptt: int = 64,
+                 max_pos_weight: float = 50.0, seed: int = 0,
+                 decays=DECAYS, time_col: str = TIME_COL) -> None:
+        self.n_channels = n_channels
+        self.hidden = hidden
+        self.epochs = epochs
+        self.lr = lr
+        self.tbptt = tbptt
+        self.max_pos_weight = max_pos_weight
+        self.seed = seed
+        self.decays = decays
+        self.time_col = time_col
+        self.core: _SelectiveSSMCore | None = None
+        self._g_mean = np.zeros(2, dtype=np.float32)
+        self._g_std = np.ones(2, dtype=np.float32)
+
+    def _pack(self, df: pd.DataFrame, fit_scaler: bool):
+        """Per-card, time-sorted sequences padded to a common length.
+
+        Returns (hour, gate, mask, rowidx) over (n_cards, max_len): the per-token
+        hour index, z-scored gate features [log dt, log prior-count], a validity
+        mask, and the original df-row index each slot maps back to. Real tokens
+        fill ``[0:len)`` and padding follows, so (read-before) padded slots never
+        affect a real token's readout.
+        """
+        order, starts, ends, dt = _sorted_groups(df, self.time_col)
+        hour_s = dt.dt.hour.to_numpy()[order].astype(np.int64)
+        t_sec = (dt.to_numpy().astype("datetime64[ns]").astype(np.int64) / 1e9)[order]
+        n_cards = len(starts)
+        max_len = int((ends - starts).max())
+
+        hour = np.zeros((n_cards, max_len), dtype=np.int64)
+        gate = np.zeros((n_cards, max_len, 2), dtype=np.float32)
+        mask = np.zeros((n_cards, max_len), dtype=bool)
+        rowidx = np.full((n_cards, max_len), -1, dtype=np.int64)
+        for ci, (s, e) in enumerate(zip(starts, ends)):
+            li = e - s
+            hour[ci, :li] = hour_s[s:e]
+            d = np.zeros(li)
+            d[1:] = t_sec[s + 1:e] - t_sec[s:e - 1]
+            gate[ci, :li, 0] = np.log1p(np.maximum(d, 0.0))
+            gate[ci, :li, 1] = np.log1p(np.arange(li))  # strictly-earlier count
+            mask[ci, :li] = True
+            rowidx[ci, :li] = order[s:e]
+
+        if fit_scaler:
+            flat = gate[mask]
+            self._g_mean = flat.mean(axis=0)
+            self._g_std = flat.std(axis=0)
+            self._g_std[self._g_std == 0] = 1.0
+        gate = ((gate - self._g_mean) / self._g_std).astype(np.float32)
+        return hour, gate, mask, rowidx
+
+    def fit(self, df: pd.DataFrame, label: np.ndarray) -> "SelectiveTemporalSSM":
+        torch.manual_seed(self.seed)
+        hour_np, gate_np, mask_np, rowidx = self._pack(df, fit_scaler=True)
+        n_cards, max_len = hour_np.shape
+
+        lab = np.asarray(label).astype(np.float32)
+        y_np = np.zeros((n_cards, max_len), dtype=np.float32)
+        valid = rowidx >= 0
+        y_np[valid] = lab[rowidx[valid]]
+        n_valid, pos = int(mask_np.sum()), float(lab.sum())
+        pos_w = torch.tensor([min((n_valid - pos) / max(pos, 1.0), self.max_pos_weight)])
+
+        hour = torch.from_numpy(hour_np)
+        gate = torch.from_numpy(gate_np)
+        mask = torch.from_numpy(mask_np)
+        y = torch.from_numpy(y_np)
+
+        self.core = _SelectiveSSMCore(self.n_channels, gate.shape[2], self.hidden, self.decays)
+        opt = torch.optim.Adam(self.core.parameters(), lr=self.lr)
+        self.core.train()
+        for _ in tqdm(range(self.epochs), desc="SelectiveTemporalSSM train"):
+            h = torch.zeros(n_cards, self.n_channels, N_HOURS)
+            for c0 in range(0, max_len, self.tbptt):
+                c1 = min(c0 + self.tbptt, max_len)
+                h = h.detach()  # truncate BPTT at chunk boundaries
+                logits = []
+                for t in range(c0, c1):
+                    h, lt = self.core.step(h, hour[:, t], gate[:, t])
+                    logits.append(lt)
+                mm = mask[:, c0:c1]
+                if not mm.any():
+                    continue
+                logit = torch.stack(logits, dim=1)
+                loss = F.binary_cross_entropy_with_logits(
+                    logit[mm], y[:, c0:c1][mm], pos_weight=pos_w)
+                opt.zero_grad()
+                loss.backward()
+                opt.step()
+        return self
+
+    def score(self, df: pd.DataFrame) -> np.ndarray:
+        """Per-transaction temporal-anomaly probability, aligned to df rows."""
+        hour_np, gate_np, _, rowidx = self._pack(df, fit_scaler=False)
+        n_cards, max_len = hour_np.shape
+        hour = torch.from_numpy(hour_np)
+        gate = torch.from_numpy(gate_np)
+        self.core.eval()
+        probs = np.zeros((n_cards, max_len), dtype=np.float32)
         with torch.no_grad():
-            _, h = self.ssm(X_t)
-            burst = torch.sigmoid(self.burst_head(h)).squeeze(1).numpy()
-            timing = torch.sigmoid(self.timing_head(h)).squeeze(1).numpy()
-            h_np = h.numpy()
-
-        card_feats = pd.DataFrame({
-            "ssm_emb_mean": h_np.mean(axis=1),
-            "ssm_emb_std": h_np.std(axis=1),
-            "ssm_emb_max": h_np.max(axis=1),
-            "ssm_burst_score": burst,
-            "ssm_timing_score": timing,
-        }, index=cards)
-
-        return df["cc_num"].map(
-            lambda cc: card_feats.loc[cc] if cc in card_feats.index
-            else pd.Series([0.0] * 5, index=card_feats.columns)
-        ).apply(pd.Series).set_index(df.index)
+            h = torch.zeros(n_cards, self.n_channels, N_HOURS)
+            for t in range(max_len):
+                h, lt = self.core.step(h, hour[:, t], gate[:, t])
+                probs[:, t] = torch.sigmoid(lt).numpy()
+        out = np.zeros(len(df), dtype=np.float32)
+        valid = rowidx >= 0
+        out[rowidx[valid]] = probs[valid]
+        return out

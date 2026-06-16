@@ -39,19 +39,15 @@ def multi_label_report(
     -------
     dict with scalar metrics and per-label breakdowns
     """
-    report = {
-        "hamming_loss": hamming_loss(y_true, y_pred),
-        "subset_accuracy": accuracy_score(y_true, y_pred),
-        "label_ranking_ap": label_ranking_average_precision_score(y_true, y_score),
-        "mean_auc": roc_auc_score(y_true, y_score, average="macro"),
-        "label_cardinality_true": float(y_true.sum(axis=1).mean()),
-        "label_cardinality_pred": float(y_pred.sum(axis=1).mean()),
-    }
-
+    n = len(y_true)
     per_label: dict[str, dict] = {}
     for i, name in enumerate(label_names):
-        if y_true[:, i].sum() == 0:
-            per_label[name] = {"auc": None, "ap": None, "prevalence": 0.0}
+        pos = int(y_true[:, i].sum())
+        # AUC/AP need both classes present in the column; a single-class label
+        # (no positives, or all positives) leaves them undefined.
+        if pos == 0 or pos == n:
+            per_label[name] = {"auc": None, "ap": None,
+                               "prevalence": float(y_true[:, i].mean())}
             continue
         per_label[name] = {
             "auc": roc_auc_score(y_true[:, i], y_score[:, i]),
@@ -59,7 +55,20 @@ def multi_label_report(
             "prevalence": float(y_true[:, i].mean()),
         }
 
-    report["per_label"] = per_label
+    # Macro AUC over the labels that are actually computable. Equivalent to
+    # roc_auc_score(..., average="macro") when every label has both classes,
+    # but that call raises on a single-class label — average the per-label
+    # AUCs ourselves so a degenerate column degrades gracefully instead.
+    computable = [v["auc"] for v in per_label.values() if v["auc"] is not None]
+    report = {
+        "hamming_loss": hamming_loss(y_true, y_pred),
+        "subset_accuracy": accuracy_score(y_true, y_pred),
+        "label_ranking_ap": label_ranking_average_precision_score(y_true, y_score),
+        "mean_auc": float(np.mean(computable)) if computable else None,
+        "label_cardinality_true": float(y_true.sum(axis=1).mean()),
+        "label_cardinality_pred": float(y_pred.sum(axis=1).mean()),
+        "per_label": per_label,
+    }
     return report
 
 
