@@ -14,7 +14,7 @@ recovers it, two ways, then runs the LR-test admission gate.
   [3] gate:       LR test on the `ring` label, compact classical M0 vs M0+GNN,
       via the production BinaryRelevanceGLM.admit_extension.
 
-Run from the project root:  python run_gnn_ring.py
+Run from the project root:  python scripts/03_gnn_ring.py
 """
 import sys
 from pathlib import Path
@@ -33,7 +33,7 @@ OUT = Path("data/processed")
 WINDOW_H = 2.0  # match inject_ring's window_hours
 CLASSICAL = ["vel_1h", "log_amt", "merch_dist_km",
              "hour_sin", "hour_cos", "age", "log_city_pop"]
-TABULAR_RING_AUC = 0.582  # from run_glm_baseline.py -- the line to beat
+TABULAR_RING_AUC = 0.582  # from scripts/01_glm_baseline.py -- the line to beat
 
 
 def load(split: str) -> pd.DataFrame:

@@ -9,13 +9,13 @@ Runs four studies on the controlled benchmark and writes tables + figures:
   D4 sensitivity   isolated AUC under +/-20% moves of each injection knob
 
 Reuses the production injectors/oracles via src/robustness.py -- nothing here
-reimplements a detector. Figures -> figures/, numeric summary -> data/processed/
-robustness_results.json.
+reimplements a detector. Figures + numeric summary (robustness_results.json) all
+go to results/.
 
 Run from the project root:
-    python run_robustness.py                 # all four studies
-    python run_robustness.py degradation     # one study (degradation|multiseed|
-                                             #   calibration|sensitivity)
+    python scripts/11_robustness.py              # all four studies
+    python scripts/11_robustness.py degradation  # one study (degradation|multiseed|
+                                                 #   calibration|sensitivity)
 """
 import json
 import sys
@@ -31,9 +31,9 @@ sys.path.insert(0, ".")
 import src.robustness as rb  # noqa: E402
 from src.inject import TYPOLOGIES  # noqa: E402
 
-FIG = Path("figures")
-FIG.mkdir(exist_ok=True)
-OUT = Path("data/processed")
+RES = Path("results")          # figures + json outputs
+RES.mkdir(exist_ok=True)
+OUT = Path("data/processed")   # parquet inputs
 COLORS = {"ring": "#d62728", "velocity": "#1f77b4", "temporal": "#2ca02c",
           "category": "#9467bd", "geo": "#ff7f0e"}
 
@@ -67,9 +67,9 @@ def run_degradation(base) -> dict:
     ax.legend(title="typology", fontsize=8)
     ax.grid(alpha=0.3)
     fig.tight_layout()
-    fig.savefig(FIG / "robustness_d1_degradation.png", dpi=130)
+    fig.savefig(RES / "robustness_d1_degradation.png", dpi=130)
     plt.close(fig)
-    print(f"\n  -> {FIG / 'robustness_d1_degradation.png'}")
+    print(f"\n  -> {RES / 'robustness_d1_degradation.png'}")
     return {"auc_by_depth": piv.where(piv.notna(), None).to_dict(),
             "n_pos_by_depth": npos.where(npos.notna(), None).astype("object").to_dict()}
 
@@ -115,9 +115,9 @@ def run_multiseed(base, seeds) -> dict:
                 f"{mean[f'auc_{t}']:.3f}", ha="center", fontsize=8)
     ax.grid(alpha=0.3, axis="y")
     fig.tight_layout()
-    fig.savefig(FIG / "robustness_d2_multiseed.png", dpi=130)
+    fig.savefig(RES / "robustness_d2_multiseed.png", dpi=130)
     plt.close(fig)
-    print(f"\n  -> {FIG / 'robustness_d2_multiseed.png'}")
+    print(f"\n  -> {RES / 'robustness_d2_multiseed.png'}")
     return summary
 
 
@@ -148,7 +148,7 @@ def run_calibration() -> dict:
     ax.grid(alpha=0.3)
     ax.set_aspect("equal", "box")
     fig.tight_layout()
-    fig.savefig(FIG / "robustness_d3_calibration.png", dpi=130)
+    fig.savefig(RES / "robustness_d3_calibration.png", dpi=130)
     plt.close(fig)
 
     # zoom on the low-probability regime where rare-label mass lives
@@ -168,9 +168,9 @@ def run_calibration() -> dict:
     ax2.grid(alpha=0.3)
     ax2.set_aspect("equal", "box")
     fig2.tight_layout()
-    fig2.savefig(FIG / "robustness_d3_calibration_zoom.png", dpi=130)
+    fig2.savefig(RES / "robustness_d3_calibration_zoom.png", dpi=130)
     plt.close(fig2)
-    print(f"\n  -> {FIG / 'robustness_d3_calibration.png'}  (+ _zoom)")
+    print(f"\n  -> {RES / 'robustness_d3_calibration.png'}  (+ _zoom)")
     return tbl.set_index("typology").to_dict(orient="index")
 
 
@@ -204,9 +204,9 @@ def run_sensitivity(base) -> dict:
     ax.legend(fontsize=8)
     ax.grid(alpha=0.3, axis="x")
     fig.tight_layout()
-    fig.savefig(FIG / "robustness_d4_sensitivity.png", dpi=130)
+    fig.savefig(RES / "robustness_d4_sensitivity.png", dpi=130)
     plt.close(fig)
-    print(f"\n  -> {FIG / 'robustness_d4_sensitivity.png'}")
+    print(f"\n  -> {RES / 'robustness_d4_sensitivity.png'}")
     return piv.drop(columns="typology").to_dict(orient="index")
 
 
@@ -232,7 +232,7 @@ def main() -> None:
     if which in ("all", "sensitivity"):
         results["sensitivity"] = run_sensitivity(base)
 
-    path = OUT / "robustness_results.json"
+    path = RES / "robustness_results.json"
     prev = {}
     if path.exists():
         prev = json.loads(path.read_text())

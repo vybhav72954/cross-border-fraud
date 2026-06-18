@@ -16,7 +16,7 @@ selective scalar.
   [2] selective: SelectiveTemporalSSM (learned input-dependent decay, true S6).
   [3] gate:      LR test on the `temporal` label, classical M0 vs M0+selective.
 
-Run from the project root:  python run_ssm_selective.py
+Run from the project root:  python scripts/06_ssm_selective.py
 """
 import sys
 from pathlib import Path
@@ -38,7 +38,7 @@ from src.models.ssm import (  # noqa: E402
 OUT = Path("data/processed")
 CLASSICAL = ["hour_sin", "hour_cos", "log_amt", "vel_1h",
              "is_weekend", "age", "log_city_pop"]
-TABULAR_TEMPORAL_AUC = 0.702  # global hour_sin/cos line (run_glm_baseline.py)
+TABULAR_TEMPORAL_AUC = 0.702  # global hour_sin/cos line (scripts/01_glm_baseline.py)
 
 
 def load(split: str) -> pd.DataFrame:

@@ -201,11 +201,18 @@ Produces `data/raw/fraudTrain.csv` and `data/raw/fraudTest.csv` (~250 MB total).
 ### 3. Build the controlled dataset and run the bake-off
 
 ```bash
-python build_injected_dataset.py   # → data/processed/injected_{train,test}.parquet
-python run_glm_baseline.py         # tabular reference grid (the line to beat)
-python run_gnn_ring.py             # windowed fan-in + RingSAGE + LR-test gate (ring)
-python run_ssm_temporal.py         # hour-rarity + TemporalSSM + LR-test gate (temporal)
+# one-shot: the whole pipeline in documented order
+python run_all.py                      # build → baseline → benchmark → gnn → ssm → … → robustness
+
+# …or step by step (run from the project root):
+python scripts/00_build_dataset.py     # → data/processed/injected_{train,test}.parquet
+python scripts/01_glm_baseline.py      # tabular reference grid (the line to beat)
+python scripts/02_model_benchmark.py   # 5-model cross-validated bake-off → results/
+python scripts/03_gnn_ring.py          # windowed fan-in + RingSAGE + LR-test gate (ring)
+python scripts/04_ssm_temporal.py      # hour-rarity + TemporalSSM + LR-test gate (temporal)
 ```
+
+All tables and figures are written to `results/` (gitignored).
 
 ### 4. Notebooks
 
@@ -232,25 +239,29 @@ jupyter lab
 cross-border-fraud/
 ├── data/
 │   ├── raw/                       # fraudTrain.csv, fraudTest.csv  (gitignored)
-│   └── processed/                 # labeled + injected parquets   (gitignored)
-├── notebooks/
-│   ├── 01_eda.ipynb … 05_log_linear.ipynb   # data + statistical-inference layer
-│   ├── 06_gnn.ipynb               # ring slot deep-dive
-│   ├── 07_mamba.ipynb             # temporal slot deep-dive
-│   └── 08_benchmark.ipynb         # bake-off summary
+│   └── processed/                 # labeled + injected parquets    (gitignored)
+├── notebooks/                     # 01_eda … 08_benchmark  (per-slot deep-dives)
 ├── src/
 │   ├── inject.py                  # controlled fraud injection + answer-key readers
 │   ├── labels.py                  # derive_labels() — rule-based, pre-model
 │   ├── features.py                # GLM design-matrix construction
 │   ├── evaluation.py              # multi-label metrics · LR test · H-L calibration
+│   ├── benchmark.py               # multi-model cross-validated bake-off engine
+│   ├── robustness.py              # injectors/oracles for the robustness suite
+│   ├── external.py                # IEEE-CIS external-validity helpers
 │   └── models/
 │       ├── glm.py                 # BinaryRelevanceGLM (+ companion models) + LR-test gate
 │       ├── gnn.py                 # merchant_window_features + RingSAGE
-│       └── ssm.py                 # card_hour_rarity + TemporalSSM
-├── build_injected_dataset.py      # builds the controlled dataset
-├── run_glm_baseline.py            # tabular reference grid
-├── run_gnn_ring.py                # GNN ring slot + LR-test gate
-├── run_ssm_temporal.py            # SSM temporal slot + LR-test gate
+│       └── ssm.py                 # card_hour_rarity + TemporalSSM (+ velocity / selective)
+├── scripts/                       # numbered pipeline, in run-order
+│   ├── 00_build_dataset.py        # builds the controlled dataset
+│   ├── 01_glm_baseline.py         # tabular reference grid
+│   ├── 02_model_benchmark.py      # 5-model cross-validated bake-off
+│   ├── 03_gnn_ring.py             # GNN ring slot + LR-test gate
+│   ├── 04_ssm_temporal.py         # SSM temporal slot + LR-test gate
+│   └── …  12_external_validity.py # velocity · selective · snapshot · category · geo · integration · robustness · external
+├── results/                       # figures + tables + json  (gitignored)
+├── run_all.py                     # one-shot pipeline driver
 ├── requirements.txt
 └── pyproject.toml
 ```

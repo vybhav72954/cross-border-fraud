@@ -6,7 +6,7 @@ fraud with known typology signatures (ring / velocity / temporal / category /
 geo), and writes the augmented frames + answer key to data/processed/.
 
 Run from the project root:
-    python build_injected_dataset.py
+    python scripts/00_build_dataset.py
 """
 import sys
 from pathlib import Path
