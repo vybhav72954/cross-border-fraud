@@ -5,6 +5,8 @@
 ### A Controlled Benchmark for Multi-Typology Card-Fraud Detection
 
 [![Python](https://img.shields.io/badge/python-3.11%2B-3776AB?logo=python&logoColor=white)](https://www.python.org/)
+[![License](https://img.shields.io/badge/license-MIT-22C55E)](LICENSE)
+[![Tests](https://img.shields.io/badge/tests-45%20passing-brightgreen)]()
 [![Code style](https://img.shields.io/badge/code%20style-ruff-D97706)](https://docs.astral.sh/ruff/)
 [![Status](https://img.shields.io/badge/status-active-brightgreen)]()
 [![Dataset](https://img.shields.io/badge/dataset-Sparkov%20CC0-0EA5E9)](https://www.kaggle.com/datasets/kartik2112/fraud-detection)
@@ -62,6 +64,45 @@ Isolated test AUC: each signature's **solo rows vs. legit** (overlaps excluded, 
 ### External validation — does the premise hold on real fraud?
 
 The reason for planting is that *real* fraud is entangled across typologies, so clean signatures must be injected to measure recovery at all. An external fold on the fully-anonymized **IEEE-CIS** dataset confirms this: the planted oracles fall to chance on real `isFraud` (card-relative hour-rarity **0.45**, decayed-rate **0.49**, versus **0.88 / 0.91** on the planted signatures), while a tabular GLM over engineered count features carries real fraud at **0.83**. Real fraud is not a single planted typology — injection is *necessary*, not a shortcut. The per-card sequence machinery still clears the same LR-test gate, but its held-out lift is marginal once those engineered counts are present (the "effect size, not raw *p*" caveat, reproduced out of domain). Because IEEE-CIS is anonymized — no merchant id, coordinates, or clean card key — the typologies cannot be re-injected there, so this fold validates the **premise and representation relevance**, not the which-representation-recovers-which thesis, which needs the answer key only injection provides.
+
+---
+
+## State-space lineage — the S4→Mamba family, head-to-head
+
+The two sequence slots (`temporal`, `velocity`) double as a **state-space modeling benchmark**: the
+S4→Mamba lineage implemented from scratch and run head-to-head against RNN / TCN / Transformer
+baselines, on the *same* per-card stream, same isolated AUC, same LR-gate. Every diagonal SSM (LRU,
+S5, DSS, Mamba-S6) shares one engine and one primitive — a work-efficient **parallel associative
+scan** of the linear recurrence $h_t = a_t \odot h_{t-1} + b_t$ — so the family reduces to "compute
+per-step $(a_t, b_t)$, scan, read out", differing only in how $a_t$ is parameterised (fixed vs.
+HiPPO-init vs. *input-dependent* selective).
+
+| family | model | temporal AUC | velocity AUC |
+|---|---|:--:|:--:|
+| ref | tabular floor / fixed-S4D / oracle | 0.647 / **0.781** / 0.879 | 0.901 / **0.902** / 0.894 |
+| rnn | GRU · LSTM | 0.638 · 0.637 | 0.749 · 0.670 |
+| conv | TCN (dilated causal) | 0.633 | 0.891 |
+| attn | Transformer (causal) | 0.594 | 0.887 |
+| **ssm** | LRU · S5 · DSS · **Mamba-S6** | 0.665 · 0.661 · 0.657 · **0.668** | 0.887 · 0.872 · 0.870 · **0.891** |
+
+*(isolated solo-vs-legit AUC, 150-card CPU subsample, every model on the same subsample; all learned
+scalars LR-admitted. `scripts/13_sequence_zoo.py`, ablations in `scripts/14_ssm_ablations.py`.)*
+
+The two slots **bracket the Mamba inductive bias**:
+
+- **Temporal** is a *stationary* per-card hour distribution. The learned SSMs top the *learned* pack
+  but selectivity buys nothing (Mamba-S6 ≈ LRU ≈ S5), all sit far below the fixed multi-timescale
+  bank (0.781), and attention is worst (0.594) — there is no per-token gating that improves a
+  stationary-distribution estimate.
+- **Velocity** is a *bursty, content-dependent* arrival pattern. Here selectivity is exactly right:
+  **Mamba-S6 leads the learned models and ties the TCN with the fewest parameters of any model**,
+  while vanilla RNNs collapse (GRU 0.749, LSTM 0.670).
+
+In short: **input-dependent state-space machinery helps when *what to remember is content-dependent*
+(velocity) and is dominated by a fixed long-memory bank when the target is stationary (temporal)** —
+a mechanistic account of where the Mamba bias pays off, not a leaderboard. A GPU **Mamba-2 (SSD)**
+fold (`notebooks/09_mamba2_ssd_kaggle.ipynb`, Kaggle addendum) stress-tests this under full-sequence
+BPTT.
 
 ---
 
