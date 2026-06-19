@@ -13,7 +13,7 @@ sequence view recovers it, two ways, then runs the LR-test admission gate.
   [3] gate:       LR test on the `temporal` label, classical M0 (incl. global
       hour) vs M0+SSM scalars, via BinaryRelevanceGLM.admit_extension.
 
-Run from the project root:  python run_ssm_temporal.py
+Run from the project root:  python scripts/04_ssm_temporal.py
 """
 import sys
 from pathlib import Path
@@ -31,7 +31,7 @@ from src.models.glm import BinaryRelevanceGLM  # noqa: E402
 OUT = Path("data/processed")
 CLASSICAL = ["hour_sin", "hour_cos", "log_amt", "vel_1h",
              "is_weekend", "age", "log_city_pop"]
-TABULAR_TEMPORAL_AUC = 0.702  # from run_glm_baseline.py -- the line to beat
+TABULAR_TEMPORAL_AUC = 0.702  # from scripts/01_glm_baseline.py -- the line to beat
 
 
 def load(split: str) -> pd.DataFrame:

@@ -32,7 +32,7 @@ Design choices, each inherited from an established result in this repo:
     scalar's G^2 is shown relative to its own matched-slot G^2, alongside the
     held-out per-label AUC lift. A neural block should move ONLY its matched label.
 
-Run from the project root:  python run_production_integration.py
+Run from the project root:  python scripts/10_production_integration.py
 """
 import json
 import sys
@@ -52,7 +52,9 @@ from src.models.gnn import merchant_window_features  # noqa: E402
 from src.models.ssm import TemporalSSM, card_hour_rarity  # noqa: E402
 from src.robustness import compact_base  # noqa: E402
 
-OUT = Path("data/processed")
+OUT = Path("data/processed")   # parquet inputs
+RES = Path("results")          # json outputs
+RES.mkdir(exist_ok=True)
 WINDOW_H = 2.0  # match inject_ring's window_hours
 
 # typology answer key -> production label, and the matched neural slot per label
@@ -227,7 +229,7 @@ def main() -> None:
         "delta_auc_gnn": d_gnn, "delta_auc_ssm": d_ssm,
         "gate_gnn": g_gnn, "gate_ssm": g_ssm,
     }
-    path = OUT / "integration_results.json"
+    path = RES / "integration_results.json"
     path.write_text(json.dumps(summary, indent=2, default=float))
     print(f"\nwrote {path}")
 

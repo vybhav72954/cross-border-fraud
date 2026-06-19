@@ -25,7 +25,7 @@ Same large-n power inflation already flagged for Hosmer-Lemeshow (RESULTS §7.3)
 a production gate should threshold on effect size (relative G^2 / held-out AUC
 lift), not raw p. The gate's ranking is sound; its p-value alone is not.
 
-Run from the project root:  python run_geo_control.py
+Run from the project root:  python scripts/09_geo_control.py
 """
 import sys
 from pathlib import Path

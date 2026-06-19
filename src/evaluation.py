@@ -16,6 +16,8 @@ from sklearn.metrics import (
     label_ranking_average_precision_score,
     roc_auc_score,
     average_precision_score,
+    precision_recall_fscore_support,
+    confusion_matrix,
 )
 
 LABEL_NAMES = ["L_V", "L_G", "L_C", "L_R", "L_T"]
@@ -115,6 +117,58 @@ def label_cooccurrence_matrix(y: np.ndarray, label_names: list[str] = LABEL_NAME
             both = ((y[:, i] == 1) & (y[:, j] == 1)).sum()
             mat[i, j] = both / len(y)
     return pd.DataFrame(mat, index=label_names, columns=label_names)
+
+
+def per_label_threshold_metrics(
+    y_true: np.ndarray,
+    y_pred: np.ndarray,
+    label_names: list[str] = LABEL_NAMES,
+) -> pd.DataFrame:
+    """Per-label precision / recall / F1 + confusion counts at fixed predictions.
+
+    Complements ``multi_label_report`` (threshold-free AUC/AP) with the classic
+    threshold-0.5 classification metrics and the raw TN/FP/FN/TP. Appends
+    ``macro`` (unweighted mean over labels) and ``micro`` (pooled counts) rows.
+
+    Parameters
+    ----------
+    y_true:  (n, K) binary ground-truth label matrix
+    y_pred:  (n, K) binary predicted label matrix
+    """
+    rows = []
+    for i, name in enumerate(label_names):
+        yt, yp = y_true[:, i], y_pred[:, i]
+        p, r, f, _ = precision_recall_fscore_support(
+            yt, yp, average="binary", pos_label=1, zero_division=0
+        )
+        tn, fp, fn, tp = confusion_matrix(yt, yp, labels=[0, 1]).ravel()
+        rows.append({"label": name, "precision": p, "recall": r, "f1": f,
+                     "support": int(yt.sum()),
+                     "tn": int(tn), "fp": int(fp), "fn": int(fn), "tp": int(tp)})
+    df = pd.DataFrame(rows).set_index("label")
+
+    tp_s, fp_s, fn_s = df["tp"].sum(), df["fp"].sum(), df["fn"].sum()
+    micro_p = tp_s / (tp_s + fp_s) if (tp_s + fp_s) else 0.0
+    micro_r = tp_s / (tp_s + fn_s) if (tp_s + fn_s) else 0.0
+    micro_f = (2 * micro_p * micro_r / (micro_p + micro_r)
+               if (micro_p + micro_r) else 0.0)
+    df.loc["macro"] = {**df[["precision", "recall", "f1"]].mean().to_dict(),
+                       "support": int(df["support"].sum()),
+                       "tn": "", "fp": "", "fn": "", "tp": ""}
+    df.loc["micro"] = {"precision": micro_p, "recall": micro_r, "f1": micro_f,
+                       "support": int(df.loc[label_names, "support"].sum()),
+                       "tn": "", "fp": "", "fn": "", "tp": ""}
+    return df
+
+
+def confusion_matrices(
+    y_true: np.ndarray,
+    y_pred: np.ndarray,
+    label_names: list[str] = LABEL_NAMES,
+) -> dict[str, np.ndarray]:
+    """Per-label 2x2 confusion matrix (rows = true 0/1, cols = pred 0/1)."""
+    return {name: confusion_matrix(y_true[:, i], y_pred[:, i], labels=[0, 1])
+            for i, name in enumerate(label_names)}
 
 
 def cross_border_stats(df: pd.DataFrame) -> dict:

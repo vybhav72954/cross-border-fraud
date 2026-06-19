@@ -14,7 +14,7 @@ which makes a plain statsmodels MLE Logit raise PerfectSeparationError. The
 statsmodels BinaryRelevanceGLM in src/models/glm.py is reserved for the
 LR-test admission gate when GNN/Mamba scalars are added.
 
-Run from the project root:  python run_glm_baseline.py
+Run from the project root:  python scripts/01_glm_baseline.py
 """
 import sys
 from pathlib import Path

@@ -24,11 +24,10 @@ torch-geometric>=2.6
 # Dataset download
 kaggle>=1.6
 
-# Optional — planned external/tabular comparison (roadmap F); not used by the
-# current controlled benchmark:
-# xgboost>=2.1
-# lightgbm>=4.5
-# tabpfn>=2.0
+# Tabular model bake-off (scripts/02_model_benchmark.py) — multi-model CV comparison.
+xgboost>=2.1
+lightgbm>=4.6.0       # >=4.6.0: CVE-2024-43598 (RCE via untrusted model load) fix
+# tabpfn>=2.0          # optional; not currently called
 
 # Optional — GPU only, requires CUDA 12+ (replaces the CPU fixed-A SSM fallback)
 # pip install mamba-ssm causal-conv1d

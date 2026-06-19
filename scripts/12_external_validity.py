@@ -21,8 +21,8 @@ Validates premise + representation relevance, NOT the which-representation-recov
 -which thesis (that needs the answer key, which only injection provides).
 
 Run from project root (after placing train_transaction.csv under data/raw/ieee/):
-    python run_external_validity.py
-    python run_external_validity.py --nrows 100000 --no-ssm   # fast premise smoke
+    python scripts/12_external_validity.py
+    python scripts/12_external_validity.py --nrows 100000 --no-ssm   # fast premise smoke
 """
 import argparse
 import json
@@ -49,7 +49,7 @@ from src.models.ssm import (  # noqa: E402
 )
 from src.models.glm import BinaryRelevanceGLM  # noqa: E402
 
-OUT = Path("data/processed")
+OUT = Path("results")   # json output (IEEE inputs read via src/external.py)
 
 # Planted-signature reference points (RESULTS.md bake-off grid) -- the contrast
 # that makes the premise check legible: clean separation on planted vs entangled

@@ -25,7 +25,7 @@ tabular slot; the knob documents a dataset limitation, not a neural opportunity.
   global cat-rarity  : 1 - the category's GLOBAL share  (what a global dummy sees)
   card cat-rarity    : 1 - the card's share of this category (card-relative oracle)
 
-Run from the project root:  python run_category_headroom.py
+Run from the project root:  python scripts/08_category_headroom.py
 """
 import sys
 from pathlib import Path

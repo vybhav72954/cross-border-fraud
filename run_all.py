@@ -5,8 +5,9 @@ One reproducibility entrypoint — chains the whole bake-off in documented order
           -> ssm(selective) -> gnn(snapshot) -> category -> geo
           -> integration -> robustness
 
-Each step is the corresponding ``run_*.py`` script (the §6 "Reproduce" list in
-RESULTS.md), run as a SEPARATE subprocess: every step loads the 1.3M-row dataset
+Each step is the corresponding numbered ``scripts/NN_*.py`` script (the §6
+"Reproduce" list in RESULTS.md), run as a SEPARATE subprocess: every step loads
+the 1.3M-row dataset
 and several import torch/PyG, so a fresh process per step keeps memory bounded and
 avoids cross-step import/state bleed. The same interpreter that launched this
 driver is reused for the children (``sys.executable``), so running it with the
@@ -27,17 +28,18 @@ from pathlib import Path
 
 # name -> (script, *args). Order here IS the pipeline order.
 STEPS: dict[str, list[str]] = {
-    "build": ["build_injected_dataset.py"],
-    "baseline": ["run_glm_baseline.py"],
-    "gnn": ["run_gnn_ring.py"],
-    "temporal": ["run_ssm_temporal.py"],
-    "velocity": ["run_ssm_velocity.py"],
-    "selective": ["run_ssm_selective.py"],
-    "snapshot": ["run_gnn_snapshot.py"],
-    "category": ["run_category_headroom.py"],
-    "geo": ["run_geo_control.py"],
-    "integration": ["run_production_integration.py"],
-    "robustness": ["run_robustness.py"],
+    "build": ["scripts/00_build_dataset.py"],
+    "baseline": ["scripts/01_glm_baseline.py"],
+    "benchmark": ["scripts/02_model_benchmark.py"],
+    "gnn": ["scripts/03_gnn_ring.py"],
+    "temporal": ["scripts/04_ssm_temporal.py"],
+    "velocity": ["scripts/05_ssm_velocity.py"],
+    "selective": ["scripts/06_ssm_selective.py"],
+    "snapshot": ["scripts/07_gnn_snapshot.py"],
+    "category": ["scripts/08_category_headroom.py"],
+    "geo": ["scripts/09_geo_control.py"],
+    "integration": ["scripts/10_production_integration.py"],
+    "robustness": ["scripts/11_robustness.py"],
 }
 ROOT = Path(__file__).resolve().parent
 

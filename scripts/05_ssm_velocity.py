@@ -19,7 +19,7 @@ count is already in the model (the gate correctly declining a redundant feature)
         (b) classical WITH vel_1h     -> the "beat the rolling count?" test:
             little headroom expected, i.e. neural matches but does not beat.
 
-Run from the project root:  python run_ssm_velocity.py
+Run from the project root:  python scripts/05_ssm_velocity.py
 """
 import sys
 from pathlib import Path
@@ -37,7 +37,7 @@ from src.models.glm import BinaryRelevanceGLM  # noqa: E402
 OUT = Path("data/processed")
 CLASSICAL = ["hour_sin", "hour_cos", "log_amt", "vel_1h",
              "is_weekend", "age", "log_city_pop"]
-TABULAR_VELOCITY_AUC = 0.882  # from run_glm_baseline.py -- the rolling-count line
+TABULAR_VELOCITY_AUC = 0.882  # from scripts/01_glm_baseline.py -- the rolling-count line
 
 
 def load(split: str) -> pd.DataFrame:

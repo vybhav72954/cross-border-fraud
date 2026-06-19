@@ -1,5 +1,6 @@
 data/raw/
 data/processed/
+results/
 *.pyc
 __pycache__/
 .ipynb_checkpoints/
