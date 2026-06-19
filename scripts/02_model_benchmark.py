@@ -110,7 +110,7 @@ def plot_cv_bars(summary: pd.DataFrame, path: Path, mean_col: str = "auc_mean",
 
 def plot_confusions(cms: dict[str, np.ndarray], model: str, path: Path) -> None:
     fig, axes = plt.subplots(1, len(TYPOLOGIES), figsize=(3.1 * len(TYPOLOGIES), 3.2))
-    for ax, typ in zip(axes, TYPOLOGIES):
+    for ax, typ in zip(axes, TYPOLOGIES, strict=True):
         cm = cms[typ]
         norm = cm / cm.sum(axis=1, keepdims=True).clip(min=1)
         annot = np.array([[f"{cm[r, c]:,}\n{norm[r, c]:.2f}" for c in range(2)]
@@ -226,7 +226,7 @@ def main() -> None:
     summary_json = {
         "models": list(zoo),
         "folds": args.folds,
-        "cv_sample_rows": int(len(idx)),
+        "cv_sample_rows": len(idx),
         "best_model": best,
         "best_mean_cv_auc_isolated": float(iso_pivot.loc[best, "mean"]),
         "cv_auc_isolated_by_model": {m: float(iso_pivot.loc[m, "mean"])

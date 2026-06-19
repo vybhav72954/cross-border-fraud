@@ -132,6 +132,20 @@ def cross_validate_models(
     rows = []
     for label in label_names:
         y = Y[label].to_numpy().astype(int)
+        # StratifiedKFold needs >= n_splits samples in the rarest class (and both
+        # classes present); a too-sparse label yields NaN rows, not a crash.
+        _, counts = np.unique(y, return_counts=True)
+        if counts.size < 2 or counts.min() < n_splits:
+            for mname in models:
+                row = {"model": mname, "label": label, "fold": np.nan,
+                       "auc": np.nan, "ap": np.nan}
+                if tags is not None:
+                    row["auc_iso"] = np.nan
+                rows.append(row)
+            if progress:
+                print(f"  cv {label:9s} skipped (sparse: {counts.tolist()})",
+                      flush=True)
+            continue
         skf = StratifiedKFold(n_splits=n_splits, shuffle=True, random_state=seed)
         for fold, (tr, va) in enumerate(skf.split(X, y)):
             for mname, factory in models.items():
@@ -176,8 +190,12 @@ def fit_score_test(
     for mname, factory in models.items():
         scores = np.zeros((X_test.shape[0], len(label_names)))
         for i, label in enumerate(label_names):
+            y = Y_train[label].to_numpy().astype(int)
+            if np.unique(y).size < 2:  # single-class train -> classifier can't fit
+                scores[:, i] = np.nan
+                continue
             clf = factory()
-            clf.fit(X_train, Y_train[label].to_numpy().astype(int))
+            clf.fit(X_train, y)
             scores[:, i] = clf.predict_proba(X_test)[:, 1]
         out[mname] = scores
     return out
