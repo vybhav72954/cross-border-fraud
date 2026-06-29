@@ -31,6 +31,8 @@ from __future__ import annotations
 import numpy as np
 import pandas as pd
 
+from src.schema import Schema, SPARKOV
+
 try:
     from tqdm.auto import tqdm
 except ImportError:  # pragma: no cover
@@ -43,26 +45,27 @@ except ImportError:  # pragma: no cover
 def merchant_window_features(
     df: pd.DataFrame,
     window_hours: float = 2.0,
-    time_col: str = "trans_date_trans_time",
+    schema: Schema = SPARKOV,
     show_progress: bool = True,
 ) -> pd.DataFrame:
-    """Time-windowed merchant fan-in, per transaction.
+    """Time-windowed merchant (``schema.target``) fan-in, per transaction.
 
-    For each row at merchant ``m`` and time ``t`` returns:
-      - ``merch_win_cards`` : distinct cards transacting at ``m`` in [t-W, t+W]
+    For each row at target ``m`` and time ``t`` returns:
+      - ``merch_win_cards`` : distinct entities transacting at ``m`` in [t-W, t+W]
       - ``merch_win_txns``  : transactions at ``m`` in [t-W, t+W]
 
     A ring (``cards_per_ring`` distinct cards in a 2h window) lifts
     ``merch_win_cards`` to ~``cards_per_ring``; a legit merchant (a few txns a
-    day) sits near 1. This is the merchant node's degree in the bipartite graph
-    restricted to a +/- ``window_hours`` time slice.
+    day) sits near 1. This is the target node's degree in the bipartite graph
+    restricted to a +/- ``window_hours`` time slice. Schema-driven so it runs on
+    any base dataset; ``SPARKOV`` reproduces the original (cc_num, merchant) build.
 
-    Single O(n) sliding-window pass per merchant (two pointers over a
-    merchant-then-time sort), so it scales to the full dataset.
+    Single O(n) sliding-window pass per target (two pointers over a
+    target-then-time sort), so it scales to the full dataset.
     """
-    t_ns = pd.to_datetime(df[time_col]).to_numpy().astype("datetime64[ns]").astype(np.int64)
-    merch = pd.factorize(df["merchant"])[0]
-    card = pd.factorize(df["cc_num"])[0]
+    t_ns = pd.to_datetime(df[schema.time]).to_numpy().astype("datetime64[ns]").astype(np.int64)
+    merch = pd.factorize(df[schema.target])[0]
+    card = pd.factorize(df[schema.entity])[0]
     n = len(df)
     w = int(window_hours * 3600 * 1_000_000_000)
 
@@ -114,15 +117,27 @@ def merchant_window_features(
 
 # ── learned signal: GraphSAGE over a (card, merchant-time-bucket) graph ──────
 
-def _card_node_table(df: pd.DataFrame, time_col: str) -> tuple[np.ndarray, dict]:
-    """Standardised per-card features [age_z, log_city_pop_z], shared train/test."""
-    cards = np.sort(df["cc_num"].unique())
+def _card_node_table(df: pd.DataFrame, schema: Schema) -> tuple[np.ndarray, dict]:
+    """Standardised per-entity node features (2 cols), shared across train/test.
+
+    Sparkov carries demographics, so the original build is [age_z, log_city_pop_z].
+    Other base datasets have no demographic analogue (``dob``/``city_pop`` absent),
+    so we fall back to dataset-agnostic per-entity activity stats
+    [log(txn_count)_z, log(mean_amount)_z]. Either way these are only weak identity
+    priors -- the ring signal is the (target, time-bucket) node degree the network
+    recovers by message passing, not the entity features."""
+    cards = np.sort(df[schema.entity].unique())
     idx = {c: i for i, c in enumerate(cards)}
-    g = df.drop_duplicates("cc_num").set_index("cc_num").loc[cards]
-    ref = pd.to_datetime(df[time_col]).max()
-    age = ((ref - pd.to_datetime(g["dob"])).dt.days / 365.25).to_numpy()
-    logpop = np.log1p(g["city_pop"].to_numpy())
-    feat = np.stack([_z(age), _z(logpop)], axis=1).astype(np.float32)
+    g = df.drop_duplicates(schema.entity).set_index(schema.entity).loc[cards]
+    if "dob" in df.columns and "city_pop" in df.columns:  # Sparkov demographics
+        ref = pd.to_datetime(df[schema.time]).max()
+        age = ((ref - pd.to_datetime(g["dob"])).dt.days / 365.25).to_numpy()
+        logpop = np.log1p(g["city_pop"].to_numpy())
+        feat = np.stack([_z(age), _z(logpop)], axis=1).astype(np.float32)
+    else:  # generic fallback: per-entity activity stats
+        cnt = df.groupby(schema.entity).size().reindex(cards).to_numpy()
+        amt = df.groupby(schema.entity)[schema.amount].mean().reindex(cards).to_numpy()
+        feat = np.stack([_z(np.log1p(cnt)), _z(np.log1p(amt))], axis=1).astype(np.float32)
     return feat, idx
 
 
@@ -148,24 +163,24 @@ class RingSAGE:
 
     def __init__(self, window_hours: float = 2.0, hidden: int = 32,
                  epochs: int = 60, lr: float = 5e-3, n_legit: int = 120_000,
-                 seed: int = 0, time_col: str = "trans_date_trans_time") -> None:
+                 seed: int = 0, schema: Schema = SPARKOV) -> None:
         self.window_hours = window_hours
         self.hidden = hidden
         self.epochs = epochs
         self.lr = lr
         self.n_legit = n_legit
         self.seed = seed
-        self.time_col = time_col
+        self.schema = schema
         self._model = None
         self._card_idx: dict = {}
 
     # graph construction -----------------------------------------------------
     def _bucket_ids(self, df: pd.DataFrame) -> np.ndarray:
-        t_ns = (pd.to_datetime(df[self.time_col]).to_numpy()
+        t_ns = (pd.to_datetime(df[self.schema.time]).to_numpy()
                 .astype("datetime64[ns]").astype(np.int64))
         w = int(self.window_hours * 3600 * 1_000_000_000)
         bucket = (t_ns // w)
-        merch = pd.factorize(df["merchant"])[0]
+        merch = pd.factorize(df[self.schema.target])[0]
         # unique (merchant, bucket) -> contiguous id
         key = merch.astype(np.int64) * (bucket.max() + 2) + bucket
         return pd.factorize(key)[0]
@@ -173,7 +188,7 @@ class RingSAGE:
     def _build_graph(self, df: pd.DataFrame, card_idx: dict):
         import torch
 
-        cidx = df["cc_num"].map(card_idx).fillna(0).astype(int).to_numpy()
+        cidx = df[self.schema.entity].map(card_idx).fillna(0).astype(int).to_numpy()
         bidx = self._bucket_ids(df)
         n_cards = len(card_idx)
         n_buckets = int(bidx.max()) + 1
@@ -223,7 +238,7 @@ class RingSAGE:
 
         torch.manual_seed(self.seed)
         rng = np.random.default_rng(self.seed)
-        self._card_feat, self._card_idx = _card_node_table(df, self.time_col)
+        self._card_feat, self._card_idx = _card_node_table(df, self.schema)
 
         ring = np.asarray(ring).astype(int)
         fraud = np.flatnonzero(ring == 1)
@@ -286,11 +301,11 @@ class SnapshotRingSAGE(RingSAGE):
     def _build_graph(self, df: pd.DataFrame, card_idx: dict):
         import torch
 
-        t_ns = (pd.to_datetime(df[self.time_col]).to_numpy()
+        t_ns = (pd.to_datetime(df[self.schema.time]).to_numpy()
                 .astype("datetime64[ns]").astype(np.int64))
         w = int(self.window_hours * 3600 * 1_000_000_000)  # = stride; window is +/- w
-        merch = pd.factorize(df["merchant"])[0].astype(np.int64)
-        cidx = df["cc_num"].map(card_idx).fillna(0).astype(int).to_numpy()
+        merch = pd.factorize(df[self.schema.target])[0].astype(np.int64)
+        cidx = df[self.schema.entity].map(card_idx).fillna(0).astype(int).to_numpy()
         n = len(df)
 
         pos = t_ns / w

@@ -32,28 +32,30 @@ import torch.nn as nn
 import torch.nn.functional as F
 from scipy.signal import lfilter
 
+from src.schema import Schema, SPARKOV
+
 try:
     from tqdm.auto import tqdm
 except ImportError:  # pragma: no cover
     def tqdm(x, **kwargs):
         return x
 
-TIME_COL = "trans_date_trans_time"
+TIME_COL = "trans_date_trans_time"  # Sparkov default; overridden by schema.time
 N_HOURS = 24
 DECAYS = (0.95, 0.99, 0.999)  # diagonal-A timescales: ~20 / ~100 / ~1000 txns
 
 
 # ── interpretable oracle: per-card hour rarity ──────────────────────────────
 
-def card_hour_rarity(df: pd.DataFrame, time_col: str = TIME_COL) -> pd.Series:
-    """Per transaction: 1 - the cardholder's share of this hour-of-day.
+def card_hour_rarity(df: pd.DataFrame, schema: Schema = SPARKOV) -> pd.Series:
+    """Per transaction: 1 - the entity's share of this hour-of-day.
 
     A card that never (rarely) transacts at hour h gets ~1.0 here for a txn at
     hour h; its habitual hours sit near 0. The card-relative timing feature the
     global hour_sin/cos cannot express, and the quantity the SSM must recover.
     """
-    hour = pd.to_datetime(df[time_col]).dt.hour
-    cc = df["cc_num"]
+    hour = pd.to_datetime(df[schema.time]).dt.hour
+    cc = df[schema.entity]
     pair = cc.astype(str) + "_" + hour.astype(str)
     pair_n = pair.map(pair.value_counts())
     card_n = cc.map(cc.value_counts())
@@ -62,10 +64,10 @@ def card_hour_rarity(df: pd.DataFrame, time_col: str = TIME_COL) -> pd.Series:
 
 # ── diagonal-SSM states: causal decayed hour-histograms ─────────────────────
 
-def _sorted_groups(df: pd.DataFrame, time_col: str):
-    dt = pd.to_datetime(df[time_col])
+def _sorted_groups(df: pd.DataFrame, schema: Schema = SPARKOV):
+    dt = pd.to_datetime(df[schema.time])
     t_ns = dt.to_numpy().astype("datetime64[ns]").astype(np.int64)
-    card = pd.factorize(df["cc_num"])[0]
+    card = pd.factorize(df[schema.entity])[0]
     order = np.lexsort((t_ns, card))  # primary card, secondary time
     cs = card[order]
     bounds = np.flatnonzero(np.diff(cs)) + 1
@@ -74,7 +76,7 @@ def _sorted_groups(df: pd.DataFrame, time_col: str):
     return order, starts, ends, dt
 
 
-def hour_ema_states(df: pd.DataFrame, decays=DECAYS, time_col: str = TIME_COL) -> np.ndarray:
+def hour_ema_states(df: pd.DataFrame, decays=DECAYS, schema: Schema = SPARKOV) -> np.ndarray:
     """Per transaction, the card's CAUSAL decayed hour-histogram at each decay.
 
     For decay ``a``: h_t = a*h_{t-1} + (1-a)*onehot(hour_t), read BEFORE the
@@ -83,7 +85,7 @@ def hour_ema_states(df: pd.DataFrame, decays=DECAYS, time_col: str = TIME_COL) -
     time). Returns (n, len(decays)*N_HOURS), aligned to df rows.
     """
     n = len(df)
-    order, starts, ends, dt = _sorted_groups(df, time_col)
+    order, starts, ends, dt = _sorted_groups(df, schema)
     hour = dt.dt.hour.to_numpy()
     oh = np.zeros((n, N_HOURS), dtype=np.float64)
     oh[np.arange(n), hour] = 1.0
@@ -167,7 +169,7 @@ class TemporalSSM:
 
     def __init__(self, decays=DECAYS, hidden: int = 64, epochs: int = 12,
                  lr: float = 3e-3, batch: int = 16384, max_pos_weight: float = 50.0,
-                 seed: int = 0, time_col: str = TIME_COL) -> None:
+                 seed: int = 0, schema: Schema = SPARKOV) -> None:
         self.decays = decays
         self.hidden = hidden
         self.epochs = epochs
@@ -175,7 +177,7 @@ class TemporalSSM:
         self.batch = batch
         self.max_pos_weight = max_pos_weight
         self.seed = seed
-        self.time_col = time_col
+        self.schema = schema
         self._model: _ReadoutMLP | None = None
         self._cont_mean = np.zeros(2, dtype=np.float32)
         self._cont_std = np.ones(2, dtype=np.float32)
@@ -183,9 +185,9 @@ class TemporalSSM:
     def _features(self, df: pd.DataFrame, fit_scaler: bool = False) -> np.ndarray:
         """[decayed hour-histograms | current one-hot | z(logdt) | z(logamt)]."""
         n = len(df)
-        states = hour_ema_states(df, self.decays, self.time_col)
+        states = hour_ema_states(df, self.decays, self.schema)
 
-        order, starts, ends, dt = _sorted_groups(df, self.time_col)
+        order, starts, ends, dt = _sorted_groups(df, self.schema)
         hour = dt.dt.hour.to_numpy()
         onehot = np.zeros((n, N_HOURS), dtype=np.float32)
         onehot[np.arange(n), hour] = 1.0
@@ -196,7 +198,7 @@ class TemporalSSM:
         dsec[starts] = 0.0
         logdt = np.zeros(n, dtype=np.float32)
         logdt[order] = np.log1p(np.maximum(dsec, 0.0)).astype(np.float32)
-        logamt = np.log1p(df["amt"].to_numpy()).astype(np.float32)
+        logamt = np.log1p(df[self.schema.amount].to_numpy()).astype(np.float32)
         cont = np.stack([logdt, logamt], axis=1)
 
         if fit_scaler:
@@ -238,7 +240,7 @@ RATE_DECAYS = (600.0, 3600.0, 86400.0)  # timescales in seconds: ~10 min / 1 h /
 
 
 def card_rate_states(df: pd.DataFrame, decays_sec=RATE_DECAYS,
-                     time_col: str = TIME_COL) -> np.ndarray:
+                     schema: Schema = SPARKOV) -> np.ndarray:
     """Per transaction, the card's CAUSAL time-decayed arrival count at each
     timescale, read BEFORE the current token.
 
@@ -252,7 +254,7 @@ def card_rate_states(df: pd.DataFrame, decays_sec=RATE_DECAYS,
     """
     n = len(df)
     taus = np.asarray(decays_sec, dtype=np.float64)
-    order, starts, ends, dt = _sorted_groups(df, time_col)
+    order, starts, ends, dt = _sorted_groups(df, schema)
     t_sec = (dt.to_numpy().astype("datetime64[ns]").astype(np.int64) / 1e9)[order]
 
     dsec = np.zeros(n, dtype=np.float64)
@@ -284,7 +286,7 @@ class VelocitySSM:
 
     def __init__(self, decays_sec=RATE_DECAYS, hidden: int = 64, epochs: int = 25,
                  lr: float = 3e-3, batch: int = 16384, max_pos_weight: float = 50.0,
-                 seed: int = 0, time_col: str = TIME_COL) -> None:
+                 seed: int = 0, schema: Schema = SPARKOV) -> None:
         self.decays_sec = decays_sec
         self.hidden = hidden
         self.epochs = epochs
@@ -292,7 +294,7 @@ class VelocitySSM:
         self.batch = batch
         self.max_pos_weight = max_pos_weight
         self.seed = seed
-        self.time_col = time_col
+        self.schema = schema
         self._model: _ReadoutMLP | None = None
         self._cont_mean = np.zeros(2, dtype=np.float32)
         self._cont_std = np.ones(2, dtype=np.float32)
@@ -300,16 +302,16 @@ class VelocitySSM:
     def _features(self, df: pd.DataFrame, fit_scaler: bool = False) -> np.ndarray:
         """[log decayed-rate bank | z(log dt) | z(log amt)]."""
         n = len(df)
-        log_states = np.log1p(card_rate_states(df, self.decays_sec, self.time_col))
+        log_states = np.log1p(card_rate_states(df, self.decays_sec, self.schema))
 
-        order, starts, ends, dt = _sorted_groups(df, self.time_col)
+        order, starts, ends, dt = _sorted_groups(df, self.schema)
         t_ns = dt.to_numpy().astype("datetime64[ns]").astype(np.int64)[order]
         dsec = np.zeros(n, dtype=np.float64)
         dsec[1:] = (t_ns[1:] - t_ns[:-1]) / 1e9
         dsec[starts] = 0.0
         logdt = np.zeros(n, dtype=np.float32)
         logdt[order] = np.log1p(np.maximum(dsec, 0.0)).astype(np.float32)
-        logamt = np.log1p(df["amt"].to_numpy()).astype(np.float32)
+        logamt = np.log1p(df[self.schema.amount].to_numpy()).astype(np.float32)
         cont = np.stack([logdt, logamt], axis=1)
 
         if fit_scaler:
@@ -414,7 +416,7 @@ class SelectiveTemporalSSM:
     def __init__(self, n_channels: int = len(DECAYS), hidden: int = 64,
                  epochs: int = 12, lr: float = 5e-3, tbptt: int = 64,
                  max_pos_weight: float = 50.0, seed: int = 0,
-                 decays=DECAYS, time_col: str = TIME_COL) -> None:
+                 decays=DECAYS, schema: Schema = SPARKOV) -> None:
         self.n_channels = n_channels
         self.hidden = hidden
         self.epochs = epochs
@@ -423,7 +425,7 @@ class SelectiveTemporalSSM:
         self.max_pos_weight = max_pos_weight
         self.seed = seed
         self.decays = decays
-        self.time_col = time_col
+        self.schema = schema
         self.core: _SelectiveSSMCore | None = None
         self._g_mean = np.zeros(2, dtype=np.float32)
         self._g_std = np.ones(2, dtype=np.float32)
@@ -437,7 +439,7 @@ class SelectiveTemporalSSM:
         fill ``[0:len)`` and padding follows, so (read-before) padded slots never
         affect a real token's readout.
         """
-        order, starts, ends, dt = _sorted_groups(df, self.time_col)
+        order, starts, ends, dt = _sorted_groups(df, self.schema)
         hour_s = dt.dt.hour.to_numpy()[order].astype(np.int64)
         t_sec = (dt.to_numpy().astype("datetime64[ns]").astype(np.int64) / 1e9)[order]
         n_cards = len(starts)
