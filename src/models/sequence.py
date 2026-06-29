@@ -36,6 +36,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from src.models.ssm import _sorted_groups  # per-card time-ordered grouping
+from src.schema import Schema, SPARKOV
 
 try:
     from tqdm.auto import tqdm
@@ -43,7 +44,7 @@ except ImportError:  # pragma: no cover
     def tqdm(x, **kwargs):
         return x
 
-TIME_COL = "trans_date_trans_time"
+TIME_COL = "trans_date_trans_time"  # Sparkov default; overridden by schema.time
 N_HOURS = 24
 
 
@@ -70,11 +71,11 @@ def associative_scan(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
 
 # ── per-card sequence packing & per-token features ──────────────────────────
 
-def _aux(df: pd.DataFrame, time_col: str):
+def _aux(df: pd.DataFrame, schema: Schema = SPARKOV):
     """Per-row (aligned to df): log inter-arrival dt, log strictly-earlier count,
     hour-of-day, plus the (order, starts, ends) card grouping."""
     n = len(df)
-    order, starts, ends, dt = _sorted_groups(df, time_col)
+    order, starts, ends, dt = _sorted_groups(df, schema)
     t_sec = (dt.to_numpy().astype("datetime64[ns]").astype(np.int64) / 1e9)[order]
     dsec = np.zeros(n)
     dsec[1:] = t_sec[1:] - t_sec[:-1]
@@ -90,7 +91,7 @@ def _aux(df: pd.DataFrame, time_col: str):
     return logdt, logcnt, hour, (order, starts, ends)
 
 
-def token_features(df, slot, scaler=None, time_col=TIME_COL):
+def token_features(df, slot, scaler=None, schema: Schema = SPARKOV):
     """Per-row float feature matrix for a slot, aligned to df.
 
     temporal: [one-hot hour (24) | z(log dt) | z(log amt)]  -- the model must
@@ -99,8 +100,8 @@ def token_features(df, slot, scaler=None, time_col=TIME_COL):
               learn the burst (short dt, rising count) without a handed-in rate.
     Returns (feats, scaler, grouping); pass the returned scaler back at score time.
     """
-    logdt, logcnt, hour, grouping = _aux(df, time_col)
-    logamt = np.log1p(df["amt"].to_numpy()).astype(np.float32)
+    logdt, logcnt, hour, grouping = _aux(df, schema)
+    logamt = np.log1p(df[schema.amount].to_numpy()).astype(np.float32)
     if slot == "temporal":
         cont = np.stack([logdt, logamt], axis=1)
     elif slot == "velocity":
@@ -346,7 +347,7 @@ class SequenceModel:
 
     def __init__(self, arch, slot, *, n_state=32, hidden=64, epochs=15, lr=3e-3,
                  batch_cards=256, max_seq=512, max_pos_weight=50.0, seed=0,
-                 time_col=TIME_COL, **arch_kw):
+                 schema: Schema = SPARKOV, **arch_kw):
         self.arch = arch
         self.slot = slot
         self.n_state = n_state
@@ -357,7 +358,7 @@ class SequenceModel:
         self.max_seq = max_seq
         self.max_pos_weight = max_pos_weight
         self.seed = seed
-        self.time_col = time_col
+        self.schema = schema
         self.arch_kw = arch_kw
         self.model: nn.Module | None = None
         self._scaler = None
@@ -372,7 +373,7 @@ class SequenceModel:
 
     def fit(self, df, label):
         torch.manual_seed(self.seed)
-        feats, self._scaler, grouping = token_features(df, self.slot, None, self.time_col)
+        feats, self._scaler, grouping = token_features(df, self.slot, None, self.schema)
         X, mask, _, y = pack(feats, grouping, label=label, max_seq=self.max_seq)
         Xt = torch.from_numpy(X)
         yt = torch.from_numpy(y)
@@ -407,7 +408,7 @@ class SequenceModel:
         return self.model(bx)
 
     def score(self, df):
-        feats, _, grouping = token_features(df, self.slot, self._scaler, self.time_col)
+        feats, _, grouping = token_features(df, self.slot, self._scaler, self.schema)
         X, mask, rowidx = pack(feats, grouping, label=None, max_seq=None)
         out = np.zeros(len(df), dtype=np.float32)
         # O(T) models score full sequences; the quadratic Transformer is scored in

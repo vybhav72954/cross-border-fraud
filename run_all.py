@@ -13,9 +13,19 @@ avoids cross-step import/state bleed. The same interpreter that launched this
 driver is reused for the children (``sys.executable``), so running it with the
 bundled venv propagates torch/PyG to every step:
 
-    .venv\\Scripts\\python.exe run_all.py            # full pipeline, in order
+    .venv\\Scripts\\python.exe run_all.py            # default chain, in order
     .venv\\Scripts\\python.exe run_all.py --skip-build  # reuse existing parquet
     .venv\\Scripts\\python.exe run_all.py gnn temporal  # a named subset, in order
+    .venv\\Scripts\\python.exe run_all.py sequence ablations  # opt-in EXTRAS
+    .venv\\Scripts\\python.exe run_all.py g3                  # G3 cross-dataset rep
+
+The default (no-args) run is the 12-step Sparkov chain above. Four numbered
+scripts are EXTRAS and run only when named explicitly: ``sequence``
+(13_sequence_zoo) and ``ablations`` (14_ssm_ablations) are CPU-heavy 150-card
+subsample showcases; ``external`` (12_external_validity) needs IEEE-CIS in
+data/raw/ieee/; ``g3`` (15_g3_replication) needs PaySim/BankSim in data/raw/. They are kept out of the default reproducibility run by design,
+but exposing them here lets the same driver exercise ``sequence.py`` (the only
+track-G module the default chain never touches) for before/after validation.
 
 Steps stop at the first failure unless ``--keep-going`` is passed. A timing/verdict
 summary prints at the end.
@@ -26,7 +36,8 @@ import sys
 import time
 from pathlib import Path
 
-# name -> (script, *args). Order here IS the pipeline order.
+# name -> (script, *args). Order here IS the pipeline order. The first block is
+# the default chain; the EXTRAS block below it is opt-in only (see EXTRAS).
 STEPS: dict[str, list[str]] = {
     "build": ["scripts/00_build_dataset.py"],
     "baseline": ["scripts/01_glm_baseline.py"],
@@ -40,7 +51,16 @@ STEPS: dict[str, list[str]] = {
     "geo": ["scripts/09_geo_control.py"],
     "integration": ["scripts/10_production_integration.py"],
     "robustness": ["scripts/11_robustness.py"],
+    # --- EXTRAS: never part of the default run; selectable only by name ---
+    "external": ["scripts/12_external_validity.py"],
+    "sequence": ["scripts/13_sequence_zoo.py"],
+    "ablations": ["scripts/14_ssm_ablations.py"],
+    "g3": ["scripts/15_g3_replication.py"],
 }
+# Excluded from the default (no-args) run: the external-data fold (needs IEEE-CIS
+# in data/raw/ieee/), the CPU-heavy 150-card sequence-zoo/ablation showcases, and
+# the G3 cross-dataset replication (needs PaySim/BankSim in data/raw/).
+EXTRAS: frozenset[str] = frozenset({"external", "sequence", "ablations", "g3"})
 ROOT = Path(__file__).resolve().parent
 
 
@@ -57,14 +77,17 @@ def main() -> None:
     p = argparse.ArgumentParser(description=__doc__,
                                 formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("steps", nargs="*", choices=list(STEPS),
-                   help="subset of steps to run, in pipeline order (default: all)")
+                   help="subset of steps to run, in pipeline order (default: the "
+                        "12-step chain; EXTRAS external/sequence/ablations/g3 "
+                        "run only when named explicitly)")
     p.add_argument("--skip-build", action="store_true",
                    help="skip the dataset build (reuse existing parquet)")
     p.add_argument("--keep-going", action="store_true",
                    help="run remaining steps even after one fails")
     args = p.parse_args()
 
-    selected = [s for s in STEPS if s in args.steps] if args.steps else list(STEPS)
+    default_steps = [s for s in STEPS if s not in EXTRAS]
+    selected = [s for s in STEPS if s in args.steps] if args.steps else default_steps
     if args.skip_build and "build" in selected:
         selected.remove("build")
 

@@ -4,6 +4,14 @@ Feature engineering for the GLM design matrix.
 Produces a clean X matrix from raw Sparkov columns + derived label columns.
 All transformations are deterministic — no fitted scalers stored here.
 Categorical variables are one-hot encoded with explicit reference categories.
+
+Two design matrices live here:
+  * ``build_features`` — the full Sparkov GLM matrix (demographics, state/gender/
+    category one-hots, geo scalars). Sparkov-specific by construction.
+  * ``cross_features`` — a 5-feature, schema-driven, demographics-free matrix
+    (``hour_sin``/``hour_cos``/``log_amt``/``vel_1h``/``is_weekend``) computable
+    on ANY base dataset via its ``Schema``. The portable tabular baseline used by
+    the cross-dataset benchmark (track G); ``SPARKOV`` reproduces the Sparkov build.
 """
 
 from __future__ import annotations
@@ -11,6 +19,8 @@ from __future__ import annotations
 import numpy as np
 import pandas as pd
 from typing import Optional
+
+from src.schema import Schema, SPARKOV
 
 
 # Reference categories (baseline for dummy encoding — chosen as most common class)
@@ -109,6 +119,50 @@ def build_features(df: pd.DataFrame,
         out["vel_1h"] = vel.reindex(df.index).fillna(1).astype(float)
 
     return out.astype(float)
+
+
+# ── schema-driven, demographics-free design matrix (track G) ─────────────────
+
+def _vel_1h(df: pd.DataFrame, schema: Schema = SPARKOV) -> np.ndarray:
+    """Per-entity rolling 1-hour txn count (inclusive), aligned to df rows.
+
+    O(n log n) per entity via ``searchsorted`` over a per-entity time sort -- the
+    schema-driven analogue of ``build_features``'s pandas rolling ``vel_1h`` that
+    runs on any base dataset (no ``trans_num`` / ``cc_num`` assumptions)."""
+    dt_ns = (pd.to_datetime(df[schema.time])
+             .to_numpy().astype("datetime64[ns]").astype(np.int64))
+    entity = df[schema.entity].to_numpy()
+    n = len(df)
+    result = np.ones(n, dtype=np.float32)
+    ONE_H = np.int64(3600 * 10**9)
+    for ent, idx in pd.Series(entity).groupby(pd.Series(entity), sort=False).groups.items():
+        idx_arr = np.asarray(idx)
+        t = dt_ns[idx_arr]
+        argsort = np.argsort(t, stable=True)
+        ts = t[argsort]
+        lo = np.searchsorted(ts, ts - ONE_H, side="left")
+        counts = np.arange(1, len(ts) + 1) - lo
+        un = np.empty_like(counts)
+        un[argsort] = counts
+        result[idx_arr] = un.astype(np.float32)
+    return result
+
+
+def cross_features(df: pd.DataFrame, schema: Schema = SPARKOV) -> pd.DataFrame:
+    """5 tabular features computable from any schema (no demographics).
+
+    ``hour_sin``/``hour_cos`` (wall-clock hour), ``log_amt``, ``vel_1h`` (per-entity
+    rolling 1h count), ``is_weekend``. The portable tabular floor for the
+    cross-dataset benchmark; ``SPARKOV`` reproduces the Sparkov columns."""
+    dt = pd.to_datetime(df[schema.time])
+    hour = dt.dt.hour.to_numpy()
+    return pd.DataFrame({
+        "hour_sin":  np.sin(2 * np.pi * hour / 24).astype(np.float32),
+        "hour_cos":  np.cos(2 * np.pi * hour / 24).astype(np.float32),
+        "log_amt":   np.log1p(df[schema.amount].to_numpy()).astype(np.float32),
+        "vel_1h":    _vel_1h(df, schema),
+        "is_weekend": (dt.dt.dayofweek >= 5).astype(np.float32).to_numpy(),
+    })
 
 
 def _merchant_state_stub(merchant_name: str) -> str:
