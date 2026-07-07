@@ -61,9 +61,25 @@ Isolated test AUC: each signature's **solo rows vs. legit** (overlaps excluded, 
 
 **Reading:** `ring` and `temporal` are the two signatures invisible to a single table row — a ring is a *time-windowed* merchant fan-in (tabular ≈ chance), a temporal anomaly is *card-relative* (global `hour_sin/cos` tops out at 0.70). In both, the learned model sits **between tabular and the hand-crafted oracle** ("the network recovers most of the signal; the oracle is the ceiling"), and clears the LR-test admission gate overwhelmingly. `geo`/`velocity`/`category` stay tabular by design — `geo` is kept as the **null-LR-test negative control**.
 
+<div align="center">
+<img src="assets/bakeoff_tabular_grid.png" alt="Tabular model selection across the five injected typologies, 5-fold cross-validated AUC" width="720">
+
+<sub><b>The tabular floor, model-by-model.</b> Ring and temporal are visibly the two bars every tabular model struggles with — the gap the GNN/SSM columns above close.</sub>
+</div>
+
 ### External validation — does the premise hold on real fraud?
 
 The reason for planting is that *real* fraud is entangled across typologies, so clean signatures must be injected to measure recovery at all. An external fold on the fully-anonymized **IEEE-CIS** dataset confirms this: the planted oracles fall to chance on real `isFraud` (card-relative hour-rarity **0.45**, decayed-rate **0.49**, versus **0.88 / 0.91** on the planted signatures), while a tabular GLM over engineered count features carries real fraud at **0.83**. Real fraud is not a single planted typology — injection is *necessary*, not a shortcut. The per-card sequence machinery still clears the same LR-test gate, but its held-out lift is marginal once those engineered counts are present (the "effect size, not raw *p*" caveat, reproduced out of domain). Because IEEE-CIS is anonymized — no merchant id, coordinates, or clean card key — the typologies cannot be re-injected there, so this fold validates the **premise and representation relevance**, not the which-representation-recovers-which thesis, which needs the answer key only injection provides.
+
+### Robustness — the namesake question, answered
+
+"Cross-border" means a transaction crossing multiple typology boundaries at once (`|L| ≥ 2`, not a geographic border). The robustness suite asks the obvious follow-up: as signatures pile up on one event, does each detector still recover *its* signature?
+
+<div align="center">
+<img src="assets/cross_border_degradation.png" alt="Matched-detector AUC versus overlap depth for all five typologies" width="600">
+
+<sub><b>4 of 5 hold flat.</b> <code>temporal</code> is the one typology that erodes with overlap depth (0.81 → 0.74) — a co-occurring velocity burst partially self-normalizes the card-relative hour-rarity oracle it depends on. Ring, velocity, category, and geo drift by ≤0.005 regardless of how many other signatures share the event.</sub>
+</div>
 
 ---
 
@@ -87,6 +103,12 @@ HiPPO-init vs. *input-dependent* selective).
 
 *(isolated solo-vs-legit AUC, 150-card CPU subsample, every model on the same subsample; all learned
 scalars LR-admitted. `scripts/13_sequence_zoo.py`, ablations in `scripts/14_ssm_ablations.py`.)*
+
+<div align="center">
+<img src="assets/sequence_zoo.png" alt="State-space lineage vs RNN/TCN/Transformer baselines on the temporal and velocity slots" width="900">
+
+<sub><b>Same eleven models, two slots, opposite winner.</b> Left: temporal (stationary) — every learned SSM clusters well below the fixed-decay bank. Right: velocity (bursty) — Mamba-S6 leads the learned pack and ties the TCN using the fewest parameters of any model in the zoo.</sub>
+</div>
 
 The two slots **bracket the Mamba inductive bias**:
 
